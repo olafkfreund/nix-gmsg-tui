@@ -120,6 +120,7 @@ Elsewhere (WezTerm, Konsole, iTerm2, Warp, Windows Terminal, Alacritty, inside t
 | `r` | move the selected or marked chats back to the inbox (from a folder) |
 | `X` | purge the trash: delete all its chats for good (from *Trash*, confirmed) |
 | `p` | parameters (from the chat list) |
+| `?` | all the keys in the footer, or only those that fit (not where `?` is typed) |
 | `Esc` | unselect, back (a message being sent goes on) |
 | `q` | quit |
 
