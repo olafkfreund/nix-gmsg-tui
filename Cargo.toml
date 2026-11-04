@@ -1,6 +1,6 @@
 [package]
 name = "gmessages-tui"
-version = "1.3.4"
+version = "1.3.5"
 edition = "2024"
 license = "AGPL-3.0-only"
 description = "Google Messages (RCS and SMS) in your terminal, paired with your Android phone. Not affiliated with Google."
@@ -16,7 +16,7 @@ members = ["gmessages-proto"]
 
 [dependencies]
 # The interface, shared with signal-tui.
-chat-tui = { package = "chat-tui-core", git = "https://github.com/louisrubet/chat-tui-core", tag = "v1.12.0", version = "1.12.0" }
+chat-tui = { package = "chat-tui-core", git = "https://github.com/louisrubet/chat-tui-core", tag = "v1.12.1", version = "1.12.1" }
 chrono = "0.4"
 crossterm = "0.28"
 base64 = "0.22"
