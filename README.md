@@ -20,10 +20,10 @@ Packages for Linux x86-64 are attached to each [release](https://github.com/loui
 
 | Distribution | Install |
 |---|---|
-| Ubuntu 24.04 | `sudo apt install ./ubuntu-24.04-gmessages-tui-1.3.3-1.amd64.deb` |
-| Ubuntu 22.04 | `sudo apt install ./ubuntu-22.04-gmessages-tui-1.3.3-1.amd64.deb` |
-| Fedora 44, 43 | `sudo dnf install ./fedora-44-gmessages-tui-1.3.3-1.x86_64.rpm` |
-| Arch Linux | `sudo pacman -U archlinux-latest-gmessages-tui-1.3.3-1-x86_64.pkg.tar.zst` |
+| Ubuntu 24.04 | `sudo apt install ./ubuntu-24.04-gmessages-tui-1.3.4-1.amd64.deb` |
+| Ubuntu 22.04 | `sudo apt install ./ubuntu-22.04-gmessages-tui-1.3.4-1.amd64.deb` |
+| Fedora 44, 43 | `sudo dnf install ./fedora-44-gmessages-tui-1.3.4-1.x86_64.rpm` |
+| Arch Linux | `sudo pacman -U archlinux-latest-gmessages-tui-1.3.4-1-x86_64.pkg.tar.zst` |
 
 Elsewhere, build it with Cargo (below). Packages are made with [multi-distro-packager](https://github.com/louisrubet/multi-distro-packager) from [packaging/](packaging/); [packaging/aur/](packaging/aur/) holds the PKGBUILD for the AUR.
 

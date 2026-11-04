@@ -1681,7 +1681,7 @@ dependencies = [
 
 [[package]]
 name = "gmessages-tui"
-version = "1.3.3"
+version = "1.3.4"
 dependencies = [
  "base64 0.22.1",
  "chat-tui-core",
