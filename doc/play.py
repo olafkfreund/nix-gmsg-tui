@@ -22,8 +22,11 @@ ENTER, ESC, UP, DOWN = b"\r", b"\x1b", b"\x1b[A", b"\x1b[B"
 
 # (pause before, keys): text is typed a character at a time.
 SCENARIO = [
-    # The chat list: pinned chats, groups, unread counts, folders below.
-    (2.5, ENTER),
+    # The chat list: pinned chats, groups, unread counts, folders below; `?` shows all the
+    # keys, and again those that fit.
+    (2.5, "?"),
+    (2.0, "?"),
+    (0.8, ENTER),
     # A group chat with photos, reactions, a reply; an answer with an emoji shortcode.
     (3.5, ENTER),
     (0.5, "Count me in for the tram "),
