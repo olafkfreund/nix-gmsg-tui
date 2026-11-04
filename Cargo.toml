@@ -16,7 +16,7 @@ members = ["gmessages-proto"]
 
 [dependencies]
 # The interface, shared with signal-tui.
-chat-tui = { package = "chat-tui-core", git = "https://github.com/louisrubet/chat-tui-core", tag = "v1.11.4", version = "1.11.4" }
+chat-tui = { package = "chat-tui-core", git = "https://github.com/louisrubet/chat-tui-core", tag = "v1.12.0", version = "1.12.0" }
 chrono = "0.4"
 crossterm = "0.28"
 base64 = "0.22"
