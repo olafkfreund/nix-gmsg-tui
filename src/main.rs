@@ -497,7 +497,8 @@ impl Sync {
     }
 
     /// A conversation new or changed on the phone, as interface events: the discussion (new,
-    /// or its title, folder and visibility for a known one), then whether it was read there.
+    /// or its title, folder and visibility for a known one), then whether it was read there
+    /// (or is unread: marked so, or new messages).
     /// Deleted for good, its messages are forgotten.
     fn conversation(&mut self, conversation: phone::Conversation) -> Vec<Event> {
         if conversation.deleted
@@ -507,7 +508,10 @@ impl Sync {
         }
         let read = if conversation.unread {
             self.read.remove(&conversation.id);
-            None
+            conversation.latest.as_ref().map(|latest| Event::Unread {
+                chat: conversation.id.clone(),
+                latest: latest.id.clone(),
+            })
         } else {
             self.read.insert(conversation.id.clone());
             Some(Event::Read {
@@ -1229,8 +1233,9 @@ mod tests {
         })
     }
 
-    #[test]
-    fn replayed_messages_received_meanwhile_are_notified() {
+    /// A sync over a new store (at the path returned) holding conversation "c" with one
+    /// message received at 100, the last one on the previous start.
+    fn sync() -> (Sync, std::path::PathBuf) {
         let mut random = [0u8; 8];
         getrandom::fill(&mut random).unwrap();
         let path = std::env::temp_dir().join(format!(
@@ -1247,7 +1252,7 @@ mod tests {
             .save_messages("c", &[message("stored", 100, false)])
             .unwrap();
         let (commands, _sent) = phone::Commands::detached();
-        let mut sync = Sync {
+        let sync = Sync {
             store,
             commands,
             known: HashSet::new(),
@@ -1257,6 +1262,37 @@ mod tests {
             stopped_ms: Some(100),
             missed: Vec::new(),
         };
+        (sync, path)
+    }
+
+    #[test]
+    fn read_or_unread_on_the_phone_is_told() {
+        let (mut sync, path) = sync();
+        let conversation = |unread: bool| {
+            serde_json::from_value(serde_json::json!({
+                "id": "c", "name": "C", "group": false, "timestamp_ms": 1, "unread": unread,
+                "latest": {"id": "stored", "text": "", "from_me": false, "sender": "Ann"},
+            }))
+            .unwrap()
+        };
+        let events = sync.conversation(conversation(true));
+        assert!(
+            matches!(&events[..], [Event::Chat(_), Event::Unread { chat, latest }]
+                if chat == "c" && latest == "stored"),
+            "{events:?}"
+        );
+        let events = sync.conversation(conversation(false));
+        assert!(
+            matches!(&events[..], [Event::Chat(_), Event::Read { chat }] if chat == "c"),
+            "{events:?}"
+        );
+        drop(sync);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn replayed_messages_received_meanwhile_are_notified() {
+        let (mut sync, path) = sync();
         let live = |sync: &mut Sync, id, ms, from_me, old| {
             sync.live("c".to_string(), message(id, ms, from_me), old)
         };

@@ -109,10 +109,11 @@ Elsewhere (WezTerm, Konsole, iTerm2, Warp, Windows Terminal, Alacritty, inside t
 | `c` | on a message being sent ("Sending…"): cancel it (it may have left already) |
 | `s` | on a message not sent (⚠ Not sent, in red): send it again |
 | `Ctrl+V` | paste the image in the clipboard |
-| `/` | find chats by name and messages by text, ignoring case and accents (from the chat list); `Enter` goes to the results, where `Enter` opens the one selected, `Space`, `P`, `a`, `r`, `Del` act on the chats found and `/` types again; `Esc` goes back |
+| `/` | find chats by name and messages by text, ignoring case and accents (from the chat list); `Enter` goes to the results, where `Enter` opens the one selected, `Space`, `P`, `u`, `a`, `r`, `Del` act on the chats found and `/` types again; `Esc` goes back |
 | `n` | new chat (from the chat list): type a name or a number, `Enter` adds the contact selected or the number, `,` adds the number typed; several make a group; `Enter` again starts the chat |
 | `Space` | mark / unmark the selected chat (`Esc` unmarks all) |
 | `P` | pin / unpin the selected chat, or the marked ones |
+| `u` | mark the selected or marked chats read, on the phone too; already read, unread (here only: telling the phone is not supported) |
 | `Shift+↑` `Shift+↓` | move the selected pinned chat up / down among the pinned ones (or `Alt+↑` `Alt+↓`) |
 | `a` | archive the selected or marked chats (from the chat list) |
 | `Del` | delete the selected or marked chats: to the trash, for good from there (confirmed); in a chat, the selected message, for you (confirmed) |
