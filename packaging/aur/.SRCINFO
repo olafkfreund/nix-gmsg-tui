@@ -1,6 +1,6 @@
 pkgbase = gmessages-tui
 	pkgdesc = Google Messages (RCS and SMS) in the terminal
-	pkgver = 1.3.5
+	pkgver = 1.3.6
 	pkgrel = 1
 	url = https://github.com/louisrubet/gmessages-tui
 	arch = x86_64
@@ -14,7 +14,7 @@ pkgbase = gmessages-tui
 	depends = webkit2gtk-4.1
 	depends = dbus
 	options = !lto
-	source = gmessages-tui-1.3.5.tar.gz::https://github.com/louisrubet/gmessages-tui/archive/v1.3.5.tar.gz
-	sha256sums = 14d609eade380258863dc7755d2661f7c99b038ee7e340ea157d480f5a37411f
+	source = gmessages-tui-1.3.6.tar.gz::https://github.com/louisrubet/gmessages-tui/archive/v1.3.6.tar.gz
+	sha256sums = a38697457acfb515970a0ddef3ecf45fe29440c43d6d578b7ada71b13e6f7ba0
 
 pkgname = gmessages-tui
