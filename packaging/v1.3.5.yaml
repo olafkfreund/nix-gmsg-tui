@@ -3,7 +3,7 @@
 #
 #   cd packaging && ~/Development/multi-distro-packager/mdpack.py v1.3.5.yaml
 
-distro: [ubuntu:24.04, ubuntu:22.04, fedora:44, fedora:43, archlinux:latest]
+distro: [ubuntu:24.04, ubuntu:22.04, fedora:45, fedora:44, fedora:43, archlinux:latest]
 
 app:
   source:

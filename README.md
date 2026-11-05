@@ -22,6 +22,7 @@ Packages for Linux x86-64 are attached to each [release](https://github.com/loui
 |---|---|
 | Ubuntu 24.04 | `sudo apt install ./ubuntu-24.04-gmessages-tui-1.3.5-1.amd64.deb` |
 | Ubuntu 22.04 | `sudo apt install ./ubuntu-22.04-gmessages-tui-1.3.5-1.amd64.deb` |
+| Fedora 45 | `sudo dnf install ./fedora-45-gmessages-tui-1.3.5-1.x86_64.rpm` |
 | Fedora 44, 43 | `sudo dnf install ./fedora-44-gmessages-tui-1.3.5-1.x86_64.rpm` |
 | Arch Linux | `sudo pacman -U archlinux-latest-gmessages-tui-1.3.5-1-x86_64.pkg.tar.zst` |
 
