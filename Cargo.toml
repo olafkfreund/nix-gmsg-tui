@@ -1,6 +1,6 @@
 [package]
 name = "gmessages-tui"
-version = "1.3.5"
+version = "1.3.6"
 edition = "2024"
 license = "AGPL-3.0-only"
 description = "Google Messages (RCS and SMS) in your terminal, paired with your Android phone. Not affiliated with Google."
