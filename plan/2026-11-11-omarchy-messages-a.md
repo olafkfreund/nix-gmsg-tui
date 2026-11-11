@@ -284,6 +284,11 @@ components, `Theme.qml`, `Errors.js`. Details are in step 7.
      - Tracing audit: list every `tracing::`/`log::` call in `src/` and
        `gmessages-proto/src/` whose fields or format include message text, cookies,
        tokens, keys or URLs with tokens. Remove those fields, and report the list.
+     - Outcome (deviation): no log call carries such a field directly. The one leak path
+       was `reqwest::Error`'s URL inside `gm::Error::Network`. `gmessages-proto/src/error.rs`
+       now builds it with `without_url()` (with a test), so error fields stay in the logs.
+       Narrow `#[allow(dead_code)]`s mark the APIs that steps 4–5 consume, and two
+       `store::Conversation` literals in `main.rs` gained the new fields.
    - `main.rs`: map the new `Event::Sent` and `Event::Unpaired` into the old TUI events.
      The behaviour can be approximate; it is deleted in step 5.
    - Tests:

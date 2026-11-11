@@ -308,6 +308,9 @@ async fn run(qr: bool, mut manual: bool) -> std::result::Result<(), Box<dyn Erro
             }
             Some(phone::Event::Status { message }) => pair::say(&message),
             Some(phone::Event::Fatal { message }) => return Err(message.into()),
+            Some(phone::Event::Unpaired { reason }) => {
+                return Err(format!("unpaired from the phone ({reason})").into());
+            }
             Some(
                 phone::Event::Connected
                 | phone::Event::History { .. }
@@ -530,6 +533,8 @@ impl Sync {
                 id: conversation.id,
                 name: conversation.name,
                 group: conversation.group,
+                timestamp_ms: conversation.timestamp_ms,
+                unread: conversation.unread,
                 hidden: conversation.deleted,
                 folder: conversation.folder,
                 messages,
@@ -750,9 +755,15 @@ fn events(
                 phone::Event::Sent {
                     id,
                     conversation,
-                    message,
-                    error,
+                    outcome,
                 } => {
+                    let (message, error) = match outcome {
+                        phone::SendOutcome::Sent(message)
+                        | phone::SendOutcome::Accepted(message) => (Some(message), None),
+                        phone::SendOutcome::Unavailable(error)
+                        | phone::SendOutcome::Rejected(error)
+                        | phone::SendOutcome::Uncertain(error) => (None, Some(error)),
+                    };
                     let done = waiting.sends.borrow_mut().remove(&id);
                     match (done, message, error) {
                         (Some(done), Some(message), None) => {
@@ -857,6 +868,9 @@ fn events(
                 )),
                 phone::Event::Fatal { message } => {
                     Event::Status(format!("Disconnected: {message}"))
+                }
+                phone::Event::Unpaired { reason } => {
+                    Event::Status(format!("Unpaired from the phone ({reason})"))
                 }
                 _ => continue,
             };
@@ -1037,6 +1051,8 @@ impl Backend for GMessages {
                     id: conversation.id,
                     name: conversation.name,
                     group: conversation.group,
+                    timestamp_ms: conversation.timestamp_ms,
+                    unread: conversation.unread,
                     hidden: conversation.deleted,
                     folder: conversation.folder,
                     messages,

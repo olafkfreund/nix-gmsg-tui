@@ -9,7 +9,7 @@ use crate::types::PairingErrorCode;
 pub enum Error {
     /// Network failure (connection, TLS, timeout of the HTTP request itself).
     #[error("network error: {0}")]
-    Network(#[from] reqwest::Error),
+    Network(reqwest::Error),
     /// The server answered with an error status.
     #[error("server error: HTTP {status}, code {code:?}: {message}")]
     Server {
@@ -50,6 +50,13 @@ pub enum Error {
     Pairing(#[from] PairingError),
 }
 
+impl From<reqwest::Error> for Error {
+    fn from(error: reqwest::Error) -> Self {
+        // Request URLs can carry signed media tokens.
+        Self::Network(error.without_url())
+    }
+}
+
 impl Error {
     /// Whether the error means the session is gone and pairing again is needed.
     pub fn is_session_gone(&self) -> bool {
@@ -87,6 +94,26 @@ impl From<prost::DecodeError> for Error {
 impl From<crate::codec::PbLiteError> for Error {
     fn from(e: crate::codec::PbLiteError) -> Self {
         Error::Decode(e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn network_error_discards_signed_url() {
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let error = client
+            .get("http://127.0.0.1:0/media?token=SECRET")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(error.url().is_some(), "the input error must carry a URL");
+
+        let error = Error::from(error);
+        assert!(!error.to_string().contains("SECRET"));
+        assert!(matches!(error, Error::Network(inner) if inner.url().is_none()));
     }
 }
 

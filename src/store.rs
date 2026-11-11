@@ -12,7 +12,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::phone;
 
 /// Version of the schema, in `PRAGMA user_version`.
-const SCHEMA: i64 = 4;
+const SCHEMA: i64 = 5;
 
 /// Messages loaded per conversation at start: the most recent ones.
 const LOADED: i64 = 1000;
@@ -26,6 +26,10 @@ pub struct Conversation {
     pub id: String,
     pub name: String,
     pub group: bool,
+    #[allow(dead_code, reason = "used by the wire DTO in step 4")]
+    pub timestamp_ms: i64,
+    #[allow(dead_code, reason = "used by the wire DTO in step 4")]
+    pub unread: bool,
     /// Gone from the phone (deleted).
     pub hidden: bool,
     /// Out of the inbox: "archive", "spam", "trash".
@@ -53,10 +57,13 @@ impl Store {
         Ok(store)
     }
 
-    fn migrate(&self) -> rusqlite::Result<()> {
+    fn migrate(&self) -> Result<(), Box<dyn Error>> {
         let version: i64 = self
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version > SCHEMA {
+            return Err("store from a newer version".into());
+        }
         if version < 1 {
             self.conn.execute_batch(
                 "CREATE TABLE conversations (
@@ -104,7 +111,16 @@ impl Store {
             self.conn
                 .execute_batch("ALTER TABLE conversations ADD COLUMN folder TEXT;")?;
         }
-        self.conn.pragma_update(None, "user_version", SCHEMA)
+        if version < 5 {
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "ALTER TABLE conversations ADD COLUMN unread INTEGER NOT NULL DEFAULT 0;
+                 PRAGMA user_version = 5;",
+            )?;
+            tx.commit()?;
+        }
+        self.conn.pragma_update(None, "user_version", SCHEMA)?;
+        Ok(())
     }
 
     /// The conversations, the most recent first, with their last messages in send order.
@@ -112,7 +128,7 @@ impl Store {
         let mut conversations = self
             .conn
             .prepare(
-                "SELECT id, name, is_group, hidden, folder FROM conversations
+                "SELECT id, name, is_group, hidden, folder, timestamp_ms, unread FROM conversations
                  ORDER BY timestamp_ms DESC",
             )?
             .query_map([], |row| {
@@ -122,6 +138,8 @@ impl Store {
                     group: row.get(2)?,
                     hidden: row.get(3)?,
                     folder: row.get(4)?,
+                    timestamp_ms: row.get(5)?,
+                    unread: row.get(6)?,
                     messages: Vec::new(),
                 })
             })?
@@ -149,10 +167,10 @@ impl Store {
         {
             let mut save = tx.prepare(
                 "INSERT INTO conversations
-                 (id, name, is_group, timestamp_ms, latest, hidden, folder)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 (id, name, is_group, timestamp_ms, latest, hidden, folder, unread)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT (id) DO UPDATE SET name = ?2, is_group = ?3, timestamp_ms = ?4,
-                 latest = ?5, hidden = ?6, folder = ?7",
+                 latest = ?5, hidden = ?6, folder = ?7, unread = ?8",
             )?;
             for c in conversations {
                 let latest = c.latest.as_ref().map(|l| &l.id);
@@ -163,7 +181,8 @@ impl Store {
                     c.timestamp_ms,
                     latest,
                     c.deleted,
-                    c.folder
+                    c.folder,
+                    c.unread
                 ])?;
             }
         }
@@ -213,10 +232,29 @@ impl Store {
             .map(Option::flatten)
     }
 
+    #[allow(dead_code, reason = "used by Sync in step 5")]
+    pub fn set_unread(&self, id: &str, unread: bool) -> rusqlite::Result<()> {
+        self.conn
+            .execute(
+                "UPDATE conversations SET unread = ?2 WHERE id = ?1",
+                params![id, unread],
+            )
+            .map(|_| ())
+    }
+
+    #[allow(dead_code, reason = "used by Sync in step 5")]
+    pub fn unread_count(&self) -> rusqlite::Result<i64> {
+        self.conn.query_row(
+            "SELECT count(*) FROM conversations WHERE folder IS NULL AND hidden = 0 AND unread = 1",
+            [],
+            |row| row.get(0),
+        )
+    }
+
     /// The conversations `ids`, without their messages.
     pub fn conversations_hidden(&self, ids: &[String]) -> rusqlite::Result<Vec<Conversation>> {
         let mut select = self.conn.prepare(
-            "SELECT id, name, is_group, hidden, folder FROM conversations WHERE id = ?1",
+            "SELECT id, name, is_group, hidden, folder, timestamp_ms, unread FROM conversations WHERE id = ?1",
         )?;
         ids.iter()
             .map(|id| {
@@ -227,6 +265,8 @@ impl Store {
                         group: row.get(2)?,
                         hidden: row.get(3)?,
                         folder: row.get(4)?,
+                        timestamp_ms: row.get(5)?,
+                        unread: row.get(6)?,
                         messages: Vec::new(),
                     })
                 })
@@ -391,6 +431,73 @@ fn restrict_new_files() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migrates_v4_without_losing_conversations() {
+        let path = temp_path("v4");
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "key", "secret").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE conversations (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, is_group INTEGER NOT NULL,
+                timestamp_ms INTEGER NOT NULL, latest TEXT, synced TEXT,
+                hidden INTEGER NOT NULL DEFAULT 0, folder TEXT
+             );
+             CREATE TABLE messages (id TEXT PRIMARY KEY, conversation TEXT NOT NULL,
+                sent_ms INTEGER NOT NULL, data TEXT NOT NULL);
+             INSERT INTO conversations (id, name, is_group, timestamp_ms)
+                VALUES ('kept', 'Kept', 1, 123);
+             PRAGMA user_version = 4;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = Store::open(&path, "secret").unwrap();
+        let rows = store.conversations().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "Kept");
+        assert_eq!(rows[0].timestamp_ms, 123);
+        assert!(!rows[0].unread);
+        assert_eq!(
+            store
+                .conn
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            5
+        );
+    }
+
+    #[test]
+    fn refuses_newer_schema() {
+        let path = temp_path("v6");
+        let store = Store::open(&path, "secret").unwrap();
+        store.conn.pragma_update(None, "user_version", 6).unwrap();
+        drop(store);
+        let error = Store::open(&path, "secret").err().unwrap();
+        assert!(error.to_string().contains("store from a newer version"));
+    }
+
+    #[test]
+    fn unread_count_uses_visible_inbox_and_updates() {
+        let path = temp_path("unread");
+        let store = Store::open(&path, "secret").unwrap();
+        let conversations: Vec<phone::Conversation> = serde_json::from_value(serde_json::json!([
+            {"id": "inbox", "name": "Inbox", "group": false, "timestamp_ms": 4, "unread": true},
+            {"id": "read", "name": "Read", "group": false, "timestamp_ms": 3},
+            {"id": "archive", "name": "Archive", "group": false, "timestamp_ms": 2,
+             "folder": "archive", "unread": true},
+            {"id": "hidden", "name": "Hidden", "group": false, "timestamp_ms": 1,
+             "deleted": true, "unread": true}
+        ]))
+        .unwrap();
+        store.save_conversations(&conversations).unwrap();
+        assert_eq!(store.unread_count().unwrap(), 1);
+        assert!(store.conversations_hidden(&["inbox".into()]).unwrap()[0].unread);
+        store.set_unread("inbox", false).unwrap();
+        assert_eq!(store.unread_count().unwrap(), 0);
+        store.set_unread("read", true).unwrap();
+        assert_eq!(store.unread_count().unwrap(), 1);
+    }
 
     fn temp_path(name: &str) -> std::path::PathBuf {
         let mut random = [0u8; 8];
