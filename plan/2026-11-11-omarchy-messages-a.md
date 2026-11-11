@@ -509,6 +509,11 @@ components, `Theme.qml`, `Errors.js`. Details are in step 7.
      - Never log request params.
      - `pair::Pairing` (the sign-in window) needs a display. Tests never call
        `pair.start google`.
+   - Deviations found in implementation (accepted):
+     - The crate-root allowance is gone. Six module-scoped `#[allow(dead_code)]`s in
+       `main.rs` (key, pair, phone, session, store, web), each with a reason, keep APIs
+       that stages b and c use.
+     - The ten listed checks are grouped into two tests in `tests/serve.rs`.
 
 7. **The QML plugin.** Coder: agy.
    - Files: new `plugin/manifest.json`, `plugin/Client.qml`, `plugin/Service.qml`,
