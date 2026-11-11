@@ -9,6 +9,7 @@ mod cli;
 mod key;
 mod pair;
 mod phone;
+mod proto;
 mod session;
 #[cfg(any(feature = "wry-signin", test))]
 mod signin;
