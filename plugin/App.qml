@@ -31,6 +31,8 @@ FloatingWindow {
     property bool helpOpen: false
     property string lastReportedFocus: "__unset__"
 
+    // Plain keys belong to a text field that has focus, not to navigation.
+    readonly property bool editing: threadView.editing || convList.editing
     readonly property bool twoColumns: root.width >= 720
     readonly property bool ready: appClient.connected && !appClient.mismatch && appClient.state === "ready"
     readonly property bool threadVisible: root.ready && root.activeConversation !== "" && (root.twoColumns || root.activeConversation !== "")
@@ -74,7 +76,8 @@ FloatingWindow {
     // Shortcuts (application context)
     Shortcut {
         sequence: "j"
-        context: Qt.ApplicationShortcut
+        context: Qt.WindowShortcut
+        enabled: !root.editing
         onActivated: {
             if (root.ready && !root.helpOpen) convList.moveSelection(1);
         }
@@ -82,7 +85,8 @@ FloatingWindow {
 
     Shortcut {
         sequence: "k"
-        context: Qt.ApplicationShortcut
+        context: Qt.WindowShortcut
+        enabled: !root.editing
         onActivated: {
             if (root.ready && !root.helpOpen) convList.moveSelection(-1);
         }
@@ -90,7 +94,8 @@ FloatingWindow {
 
     Shortcut {
         sequence: "Down"
-        context: Qt.ApplicationShortcut
+        context: Qt.WindowShortcut
+        enabled: !threadView.editing
         onActivated: {
             if (root.ready && !root.helpOpen) convList.moveSelection(1);
         }
@@ -98,7 +103,8 @@ FloatingWindow {
 
     Shortcut {
         sequence: "Up"
-        context: Qt.ApplicationShortcut
+        context: Qt.WindowShortcut
+        enabled: !threadView.editing
         onActivated: {
             if (root.ready && !root.helpOpen) convList.moveSelection(-1);
         }
@@ -106,7 +112,8 @@ FloatingWindow {
 
     Shortcut {
         sequence: "Return"
-        context: Qt.ApplicationShortcut
+        context: Qt.WindowShortcut
+        enabled: !root.editing
         onActivated: {
             if (root.ready && !root.helpOpen) convList.activateCurrent();
         }
@@ -114,7 +121,8 @@ FloatingWindow {
 
     Shortcut {
         sequence: "i"
-        context: Qt.ApplicationShortcut
+        context: Qt.WindowShortcut
+        enabled: !root.editing
         onActivated: {
             if (root.ready && !root.helpOpen && root.activeConversation !== "") {
                 threadView.focusComposer();
@@ -124,7 +132,7 @@ FloatingWindow {
 
     Shortcut {
         sequence: "Ctrl+Return"
-        context: Qt.ApplicationShortcut
+        context: Qt.WindowShortcut
         onActivated: {
             if (root.ready && !root.helpOpen && root.activeConversation !== "") {
                 threadView.sendFromShortcut();
@@ -134,7 +142,8 @@ FloatingWindow {
 
     Shortcut {
         sequence: "/"
-        context: Qt.ApplicationShortcut
+        context: Qt.WindowShortcut
+        enabled: !root.editing
         onActivated: {
             if (root.ready && !root.helpOpen) {
                 if (!root.twoColumns && root.activeConversation !== "") {
@@ -147,7 +156,8 @@ FloatingWindow {
 
     Shortcut {
         sequence: "?"
-        context: Qt.ApplicationShortcut
+        context: Qt.WindowShortcut
+        enabled: !root.editing
         onActivated: {
             root.helpOpen = !root.helpOpen;
         }
@@ -155,7 +165,8 @@ FloatingWindow {
 
     Shortcut {
         sequence: "q"
-        context: Qt.ApplicationShortcut
+        context: Qt.WindowShortcut
+        enabled: !root.editing
         onActivated: {
             root.visible = false;
         }
@@ -163,7 +174,7 @@ FloatingWindow {
 
     Shortcut {
         sequence: "Escape"
-        context: Qt.ApplicationShortcut
+        context: Qt.WindowShortcut
         onActivated: {
             if (root.helpOpen) {
                 root.helpOpen = false;

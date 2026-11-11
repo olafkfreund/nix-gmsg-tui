@@ -16,6 +16,19 @@ Item {
     property bool compact: false
     // Set by App: the window is visible and active, so arriving messages are being read.
     property bool focused: false
+    readonly property bool editing: composer.editing
+    // A message came in while the window was not focused: mark it read on return.
+    property bool readOwed: false
+
+    onFocusedChanged: {
+        if (root.focused && root.readOwed && root.conversationId !== "") {
+            root.readOwed = false;
+            var conv = root.conversationId;
+            root.client.send("read", { conversation: conv }, function() {
+                root.conversationRead(conv);
+            });
+        }
+    }
 
     signal backRequested()
     signal conversationRead(string id)
@@ -27,6 +40,7 @@ Item {
 
     onConversationIdChanged: {
         root.typingPeer = "";
+        root.readOwed = false;
         if (root.conversationId === "") {
             root.messages = [];
             root.truncated = false;
@@ -114,10 +128,14 @@ Item {
         function onMessageArrived(conv, msg, notify) {
             if (conv !== root.conversationId || !msg) return;
             root.mergeMessages([msg], false);
-            if (root.focused && !msg.from_me && !msg.pending) {
-                root.client.send("read", { conversation: conv }, function() {
-                    root.conversationRead(conv);
-                });
+            if (!msg.from_me && !msg.pending) {
+                if (root.focused) {
+                    root.client.send("read", { conversation: conv }, function() {
+                        root.conversationRead(conv);
+                    });
+                } else {
+                    root.readOwed = true;
+                }
             }
         }
 
@@ -127,6 +145,12 @@ Item {
         }
 
         function onStateChanged() {
+            if (root.client.state === "ready" && root.conversationId !== "") {
+                root.openThread(root.conversationId);
+            }
+        }
+
+        function onResynced() {
             if (root.client.state === "ready" && root.conversationId !== "") {
                 root.openThread(root.conversationId);
             }

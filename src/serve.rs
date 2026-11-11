@@ -30,6 +30,7 @@ enum Incoming {
     Phone(phone::Event),
     Pasted(pair::Pasted),
     PairDone,
+    Key(Result<Result<String, key::KeyError>, tokio::task::JoinError>),
 }
 
 enum PairStatus {
@@ -65,6 +66,7 @@ struct Daemon {
     control: Option<phone::Control>,
     pairing: Option<JoinHandle<()>>,
     pair_status: Option<mpsc::Sender<PairStatus>>,
+    key_busy: bool,
     data: PathBuf,
     tx: mpsc::Sender<Incoming>,
 }
@@ -128,10 +130,11 @@ async fn serve_bound(listener: UnixListener, data: PathBuf, _media: &Path) -> io
         control: None,
         pairing: None,
         pair_status: None,
+        key_busy: false,
         data,
         tx,
     };
-    daemon.try_key().await;
+    daemon.start_key();
     let mut retry = tokio::time::interval_at(
         Instant::now() + Duration::from_secs(30),
         Duration::from_secs(30),
@@ -141,17 +144,23 @@ async fn serve_bound(listener: UnixListener, data: PathBuf, _media: &Path) -> io
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     loop {
         tokio::select! {
-            accepted = listener.accept() => {
-                let (stream, _) = accepted?;
-                if stream.peer_cred()?.uid() == unsafe { libc::geteuid() } {
-                    daemon.accept(stream);
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) => {
+                    if stream.peer_cred().is_ok_and(|c| c.uid() == unsafe { libc::geteuid() }) {
+                        daemon.accept(stream);
+                    }
                 }
-            }
+                // Out of fds or a client that reset: keep serving the others.
+                Err(error) => {
+                    eprintln!("accept: {error}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            },
             incoming = rx.recv() => {
                 if let Some(incoming) = incoming { daemon.receive(incoming).await; }
             }
             _ = retry.tick() => {
-                if matches!(daemon.state, proto::State::Locked | proto::State::KeyringMissing) { daemon.try_key().await; }
+                if matches!(daemon.state, proto::State::Locked | proto::State::KeyringMissing) { daemon.start_key(); }
             }
             _ = deadlines.tick() => daemon.expire(),
             _ = term.recv() => break,
@@ -187,9 +196,26 @@ impl Daemon {
         ));
     }
 
-    async fn try_key(&mut self) {
+    /// Looks the store key up off the loop: Secret Service may show an unlock prompt and wait
+    /// on it without a time limit. One lookup at a time, so retries never stack prompts.
+    fn start_key(&mut self) {
+        if self.key_busy {
+            return;
+        }
+        self.key_busy = true;
         let db = self.data.join("messages.db");
-        let key = tokio::task::spawn_blocking(move || key::store_key(&db)).await;
+        let tx = self.tx.clone();
+        tokio::task::spawn_local(async move {
+            let key = tokio::task::spawn_blocking(move || key::store_key(&db)).await;
+            let _ = tx.send(Incoming::Key(key)).await;
+        });
+    }
+
+    fn got_key(&mut self, key: Result<Result<String, key::KeyError>, tokio::task::JoinError>) {
+        self.key_busy = false;
+        if self.sync.is_some() {
+            return;
+        }
         let key = match key {
             Ok(Ok(key)) => key,
             Ok(Err(error)) => {
@@ -387,6 +413,7 @@ impl Daemon {
     async fn receive(&mut self, incoming: Incoming) {
         match incoming {
             Incoming::Closed(conn) => self.close(conn),
+            Incoming::Key(key) => self.got_key(key),
             Incoming::PairDone => {
                 self.pairing = None;
                 self.pair_status = None;
@@ -532,23 +559,13 @@ impl Daemon {
         let mut outputs = Vec::new();
         match request.method.as_str() {
             "state" => reply = to_value(self.state_data()).map_err(|e| e.to_string()),
+            // The answer arrives as a state event; the lookup may wait on an unlock prompt.
             "key.retry" => {
                 if matches!(
                     self.state,
                     proto::State::Locked | proto::State::KeyringMissing
-                ) && timeout(Duration::from_secs(15), self.try_key())
-                    .await
-                    .is_err()
-                {
-                    self.write(
-                        conn,
-                        &proto::Reply::err(
-                            Some(id),
-                            proto::ErrorCode::Timeout,
-                            "key retry timed out",
-                        ),
-                    );
-                    return;
+                ) {
+                    self.start_key();
                 }
             }
             "pair.cancel" => {
@@ -743,14 +760,15 @@ impl Daemon {
                         tokio::select! {
                             pasted = pairing.next() => {
                                 let Some(pasted) = pasted else { break };
-                                let cookies = matches!(pasted, pair::Pasted::Cookies(_));
                                 let unavailable = matches!(pasted, pair::Pasted::Unavailable(_));
                                 if tx.send(Incoming::Pasted(pasted)).await.is_err() { return; }
                                 if unavailable { return; }
-                                if cookies { pairing.finish(); let _ = tx.send(Incoming::PairDone).await; return; }
+                                // After cookies the page stays up, to show the emoji and the outcome.
                             }
                             status = status_rx.recv() => {
-                                if let (Some(status), Some(page)) = (status, pairing.page()) {
+                                let Some(status) = status else { break };
+                                let paired = matches!(status, PairStatus::Paired);
+                                if let Some(page) = pairing.page() {
                                     match status {
                                         PairStatus::Asking => page.asking(),
                                         PairStatus::Emoji(emoji) => page.emoji(&emoji),
@@ -758,6 +776,7 @@ impl Daemon {
                                         PairStatus::Paired => page.paired(),
                                     }
                                 }
+                                if paired { pairing.finish(); let _ = tx.send(Incoming::PairDone).await; return; }
                             }
                         }
                     }

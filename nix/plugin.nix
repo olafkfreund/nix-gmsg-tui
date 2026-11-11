@@ -26,7 +26,8 @@ stdenvNoCC.mkDerivation {
     runHook preInstallCheck
     qmllint --import disable --unresolved-type disable --missing-type disable \
       --missing-property disable --unqualified disable $out/*.qml
-    ! grep -r @notifySend@ $out
+    # Not `! grep`: errexit ignores a negated command.
+    if grep -r @notifySend@ $out; then exit 1; fi
     runHook postInstallCheck
   '';
 }

@@ -16,14 +16,22 @@ Item {
     property string replyToId: ""
 
     property bool sending: false
+    readonly property bool editing: inputField.activeFocus
     property string statusNote: ""
     property string errorNote: ""
 
     implicitHeight: col.implicitHeight + root.theme.padY * 2
 
+    // Drafts stay with their conversation, so text never moves to another recipient.
+    property var drafts: ({})
+    property string draftFor: ""
+
     onConversationIdChanged: {
         root.statusNote = "";
         root.errorNote = "";
+        root.drafts[root.draftFor] = inputField.text;
+        inputField.text = root.drafts[root.conversationId] || "";
+        root.draftFor = root.conversationId;
     }
 
     function focusInput() {
@@ -54,6 +62,8 @@ Item {
                 if (root.conversationId === conv) {
                     inputField.text = "";
                     root.replyToId = "";
+                } else {
+                    delete root.drafts[conv];
                 }
                 if (r.data.status === "accepted") {
                     root.statusNote = I18n.t("gmessages.sending_pending", "sending…");

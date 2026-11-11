@@ -15,6 +15,7 @@ Item {
     property string selectedName: ""
     property string filterText: ""
     property bool filterActive: false
+    readonly property bool editing: filterField.activeFocus
 
     signal conversationSelected(string id, string name)
 
@@ -181,6 +182,11 @@ Item {
     Connections {
         target: root.client
         function onStateChanged() {
+            if (root.client.state === "ready") {
+                root.reload();
+            }
+        }
+        function onResynced() {
             if (root.client.state === "ready") {
                 root.reload();
             }

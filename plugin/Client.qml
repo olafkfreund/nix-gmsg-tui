@@ -20,6 +20,8 @@ Item {
     signal messageArrived(string conv, var msg, bool notify)
     signal missed(int count)
     signal typing(string conversation, string name, bool started)
+    // After every handshake: state is re-read, so views reload what they missed.
+    signal resynced()
 
     property int seq: 0
     property var pending: ({})
@@ -77,6 +79,15 @@ Item {
                 if (!r.ok && r.error && r.error.code === "protocol_mismatch") {
                     root.mismatch = true;
                 }
+                if (!r.ok) return;
+                root.send("state", {}, function(s) {
+                    if (s.ok && s.data) {
+                        root.state = String(s.data.state);
+                        root.detail = s.data.detail !== undefined ? s.data.detail : null;
+                        root.unread = Number(s.data.unread) || 0;
+                    }
+                    root.resynced();
+                });
             },
             timer: t
         };

@@ -705,6 +705,30 @@ components, `Theme.qml`, `Errors.js`. Details are in step 7.
      any fix.
    - Traps: never touch p510 or razer.
 
+## Review fixes (after step 8)
+
+The final reviews (Opus, Codex) found these; fixed before step 9, by the lead:
+
+- `src/serve.rs`: the key lookup runs off the loop and reports back as an event (a
+  Secret Service unlock prompt waits without a time limit, which froze the daemon);
+  `key.retry` returns at once and the outcome is a `state` event. An accept error
+  (EMFILE) is logged, not fatal. The manual pairing page stays up after cookies until
+  the phone confirms, so it shows the emoji and failures.
+- `plugin/App.qml`: shortcuts are `Qt.WindowShortcut` (application scope took Return,
+  Escape and the arrows from every shell surface), and plain keys are off while a
+  text field has focus.
+- `plugin/Client.qml`: after every handshake the client re-reads `state` and emits
+  `resynced`, so the list and the thread reload what a disconnect missed.
+- `plugin/Thread.qml`: a message that arrived unfocused is marked read when the
+  window regains focus. `plugin/Composer.qml`: drafts are kept per conversation.
+- `nix/plugin.nix`: the `@notifySend@` check uses `if grep`, since `! grep` never
+  fails under errexit.
+
+Left for stage b (recorded, not fixed): a cap on client count and on the bytes of a
+`history` reply, the `conversations` snippet cost, pairing-cancel racing a new
+pairing, notifications beyond three in flight, and message text on the `notify-send`
+command line.
+
 ## Tests
 
 | When | Command | Expected |
