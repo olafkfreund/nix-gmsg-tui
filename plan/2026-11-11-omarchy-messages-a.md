@@ -195,6 +195,11 @@ components, `Theme.qml`, `Errors.js`. Details are in step 7.
        `chat-tui-core-1.12.1` and `emoji-expander-1.2.2` (`Cargo.lock:543,1099`). Start
        with `lib.fakeHash`; Claude fills in the real hash from the first build.
      - `cargoTestFlags = [ "--workspace" ]`.
+     - Deviation found in implementation: `preBuild` exports
+       `LIBSQLITE3_SYS_USE_PKG_CONFIG=0`. nixpkgs' `cargoUseSystemLibs` hook sets it to
+       1, which makes rusqlite link a system SQLCipher (first a link failure, then
+       `PRAGMA key` test failures with system `sqlcipher`) instead of building
+       `bundled-sqlcipher`.
    - `flake.nix`: input nixpkgs `github:NixOS/nixpkgs/nixos-unstable`.
      - `packages.x86_64-linux.{default,gmessages-tui}`.
      - `devShells.default` with `rustc`, `cargo`, `clippy`, `rustfmt`, `rust-analyzer`,
