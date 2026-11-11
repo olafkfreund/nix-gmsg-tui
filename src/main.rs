@@ -172,7 +172,7 @@ async fn run(qr: bool, mut manual: bool) -> std::result::Result<(), Box<dyn Erro
     let state = config.read_marks.parent().ok_or("no state directory")?;
     create_private_dir(state)?;
     let session = state.join("session.json");
-    // The store first: its passphrase may be asked.
+    // The store first: its key must be available.
     let store_path = state.join("messages.db");
     let store = Rc::new(store::Store::open(
         &store_path,
