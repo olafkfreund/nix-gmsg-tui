@@ -13,215 +13,268 @@ These are defaults, chosen from what p620 already does. Change any of them at re
 | # | Question | Decision |
 |---|----------|----------|
 | 1 | Issue number | None. Issues stay disabled; the slug has no number. |
-| 2 | Plugin id and name | `olafkfreund.gmessages`, shown as "Messages". |
-| 3 | How p620 gets it | Home-manager's `programs.nixarchy.plugins."olafkfreund.gmessages".src` plus `local.omarchy.enableOnce`, in a new host module in `~/.config/nixos`, like `hosts/common/nixos/omarchy-omateams.nix`. The flake is an input there. |
-| 4 | Secret Service on p620 | Whatever answers `org.freedesktop.secrets` on the session bus. The backend reports "locked" or "missing" in the window; we don't pick a provider. |
-| 5 | Panel or window | Its own floating window (a Quickshell `FloatingWindow`), opened from the bar widget, a notification, or `omarchy-shell olafkfreund.gmessages toggle`. "One window, one job" fits better than a shell popover for a chat. |
+| 2 | Plugin id and name | `olafkfreund.gmessages`, shown as "Messages". The license is AGPL-3.0-only, the same as the repository. |
+| 3 | How p620 gets it | The flake is an input of `~/.config/nixos`. A new host module, like `hosts/common/nixos/omarchy-omateams.nix`, imports `homeManagerModules.default` (package and user unit) and sets `programs.nixarchy.plugins."olafkfreund.gmessages".src` and `local.omarchy.enableOnce`. The flake's own module doesn't touch nixarchy options, so it evaluates anywhere. |
+| 4 | Secret Service on p620 | Whatever answers `org.freedesktop.secrets` on the session bus. The window reports "locked" or "missing"; we don't pick a provider. |
+| 5 | Panel or window | Its own floating window: manifest kind `panel`, entry `App.qml`, a Quickshell `FloatingWindow`, the same as omamail's panel opened as a window. It opens from the bar widget, a notification, or `omarchy-shell olafkfreund.gmessages toggle`. |
 | 6 | Stages | (a) packaging, backend, pairing, conversation list, history, send, badge, notifications; (b) media, reactions; (c) contacts and new chats, archive, restore, delete, unpair, remove all data. One plan per stage. This spec covers all three. |
+
+**One deliberate change to the intent, for approval.** The intent said the backend stops
+on stdin EOF so that "a plugin reload or shell exit leaves nothing behind". This design
+runs the backend as a systemd user unit instead. It survives plugin reloads and shell
+restarts, so the Google session and notifications don't drop. "Nothing behind" becomes
+"nothing unmanaged": the unit is the one owner, systemd stops it at logout, and stopping
+it cleans up. The intent's "tests over real pipes" become tests over the real socket.
 
 ## Design
 
 ```mermaid
 flowchart LR
   phone[Android phone] <--> google[Google Messages relay]
-  google <--> backend[gmessages-tui serve<br/>systemd user service]
+  google <--> backend[gmessages-tui serve<br/>systemd user unit]
   backend --> store[(SQLCipher store<br/>~/.local/share/gmessages-tui)]
   backend --> win[sign-in window<br/>WebKitGTK child]
-  backend <-- NDJSON over unix socket --> svc[Service.qml<br/>notifications, unread]
+  backend <-- NDJSON / unix socket --> svc[Service.qml<br/>notifications]
   backend <-- NDJSON --> bar[BarWidget.qml<br/>badge]
   backend <-- NDJSON --> app[App.qml<br/>window]
 ```
 
+This is the transport of the owner's `nixarchy-meetingai` plugin (`Client.qml`:
+newline-delimited JSON over a unix socket, one client per QML entry point, events
+broadcast to all).
+
 ### 1. Backend: `gmessages-tui serve`
 
-A long-running daemon under systemd, not a child of the shell. This is the pattern of the
-owner's `nixarchy-meetingai` plugin (`Client.qml`: newline-delimited JSON over a unix
-socket, one client per QML entry point, events broadcast to all). It was chosen over
-omamail's stdin/stdout child process because:
-- three entry points need the same state;
-- a plugin reload or shell restart must not drop the Google session;
-- notifications keep working with the window closed.
+**CLI** (`src/main.rs`): `serve`, `--version` and the hidden `--internal-google-signin`,
+nothing else. `--unpair` and `--uninstall` leave the CLI. They become daemon methods
+(stage c), so nothing races the running owner of the store.
 
-Rust layout (the binary keeps its name and its state paths):
+**Removed with the TUI:**
+- the chat-tui `Backend` impl and `chat_tui::run` / `Config` / `qr::print_qr`;
+- crossterm and rpassword;
+- the terminal reader of manual pairing: `pair.rs` `read_terminal`, raw mode, and the
+  cURL paste in the terminal.
 
-- `src/main.rs`: CLI only. It keeps `--version`, `--unpair` and `--uninstall`, adds
-  `serve`, and keeps the hidden `--internal-google-signin`. The chat-tui `Backend` impl,
-  `chat_tui::run` and `print_qr` are removed.
-- `src/paths.rs` (new): replaces `chat_tui::Config`. Data is `dirs::data_dir()/gmessages-tui`
-  (session, store, `phone.log`, the old TUI's read marks unused). Cache is
-  `dirs::cache_dir()/gmessages-tui`. Runtime is `$XDG_RUNTIME_DIR/gmessages-tui` (mode 0700:
-  socket, lock, decrypted media). These are the paths the TUI used, so `--uninstall` keeps
-  working.
-- `src/sync.rs` (new): the `Sync` logic moved out of `main.rs`, with its UI types replaced
-  by the protocol types. It covers store writes, missed and old message tracking, and
-  history fetches.
-- `src/serve.rs` (new): socket server, clients, request dispatch, event broadcast,
-  lifecycle.
-- `src/proto.rs` (new): the wire types, versioned. They are the only types that are
-  serialized to clients.
-- `src/store.rs`: its one `chat_tui::data::Attachment` use becomes a local type.
-- `src/phone.rs`, `pair.rs`, `web.rs`, `signin*`: unchanged except where `Sync` moving
-  requires it.
-- `Cargo.toml`: drop `chat-tui-core`, `crossterm` and `rpassword` (no terminal prompt any
-  more). Add `qrcode` and `dirs` (both already in the lock tree) as direct dependencies.
-  `emoji-expander` goes if nothing else pulls it.
+The manual path is now only the localhost page in `src/web.rs`, which already takes the
+cookies from a browser. `pair::say` (stdout) gives way to `pairing` events.
 
-Lifecycle:
-- **Single instance:** `flock` on `runtime/lock`. A second `serve` exits 1 with
-  "already running (pid N)".
-- **Startup:** it binds `runtime/daemon.sock` (0600) and accepts only peers with its own
-  uid (`SO_PEERCRED`). Then it opens the store, then starts the phone.
-- **Shutdown:** SIGTERM, SIGINT and a systemd stop call `phone::Control::stop` (which
-  saves the session), kill the sign-in child, remove the socket, and exit within 5 s.
-- **Store key** (`src/key.rs`): `GMESSAGES_TUI_PASSPHRASE` if set; empty is refused. Else
-  the keyring. When the keyring is locked or missing, the backend stays up in state
-  `locked` and retries on `key.retry` and every 30 s. A keyring that refuses to store a new
-  key is reported, never fatal (fixes `key.rs:29`). The rpassword prompt is gone. A store
-  that exists but won't open with the key is never recreated.
-- **Sending:** a send whose delivery is uncertain (timeout) is reported as
-  `send_uncertain` and never retried automatically.
+**Module changes:**
+- `src/paths.rs` (new): data is `dirs::data_dir()/gmessages-tui`, the path the README
+  documents for the TUI. Cache is `dirs::cache_dir()/gmessages-tui`. Runtime is
+  `$XDG_RUNTIME_DIR/gmessages-tui`, created by systemd (`RuntimeDirectory=`, removed when
+  the unit stops) and cleared by `serve` at startup too.
+- `src/sync.rs` (new): `Sync` moved from `main.rs`, emitting protocol events instead of
+  chat-tui events. It keeps the `known`/`deleted`/`old` checks of `Sync::live`
+  (`main.rs:460-496`).
+- `src/serve.rs` (new): socket, clients, dispatch, broadcast, lifecycle.
+- `src/proto.rs` (new): the wire types, and the only serialized types.
+- `src/store.rs`:
+  - a local `Attachment` replaces chat-tui's, with the same fields and `PartialEq`;
+  - a new `unread INTEGER NOT NULL DEFAULT 0` column on `conversations`, written with
+    each conversation;
+  - migration v5, run inside a transaction with its `user_version` update. Older
+    migrations are untouched.
+- `src/phone.rs`:
+  - `pair` keeps its `CancelToken` in `State`, so a new `Command::CancelPairing` can
+    stop pairing.
+  - `send` returns a typed outcome: `Sent(message)` (echoed), `Accepted(message)`
+    (accepted, no echo yet: temporary id, replaced at the next fetch), `Rejected(reason)`,
+    or `Uncertain(reason)` (transport error once the request may have left).
+  - `Command::Read` clears the local `unread` flag.
+- `src/web.rs`: `Page` aborts its server task on drop, so a cancelled pairing revokes its
+  URL. The URL is never logged.
+- `src/key.rs`: blocking keyring calls run in `spawn_blocking`.
+- `phone.log`: `info` by default, cut to its last 1 MiB at startup. It never logs message
+  text, cookies, tokens or the pairing URL. A plan step greps the existing `tracing`
+  calls for these.
+- `Cargo.toml`: drop `chat-tui-core`, `crossterm` and `rpassword`. Add `qrcode` and
+  `dirs` (both already in the lock tree) as direct dependencies. `emoji-expander` goes if
+  nothing else pulls it.
+
+**Lifecycle:**
+- **Single owner:** `flock` (close-on-exec) on `<data>/lock`, which guards the store
+  itself. A second `serve` exits 1 with "already running (pid N)". With the lock held, a
+  stale `daemon.sock` is removed, then the socket is bound (0600). Only peers with the
+  daemon's uid are accepted (`SO_PEERCRED`).
+- **Startup order:** lock, socket, store key, store, phone. Each state is visible to
+  clients as it happens.
+- **Shutdown:** SIGTERM or SIGINT calls `phone::Control::stop` (session saved), kills the
+  sign-in child, clears `runtime/media`, removes the socket, and exits within 5 s.
+- **Destructive methods** (stage c `unpair`, `uninstall`): stop the phone without saving
+  the session, finish in-flight work, then delete. Unpair keeps the store; uninstall
+  deletes the store, its keyring entry, the cache and the data dir.
+- **Store key:** `GMESSAGES_TUI_PASSPHRASE` if set; empty is refused. Else the keyring.
+  Locked, missing or refusing to store gives the `locked` or `keyring_missing` state and
+  a retry on `key.retry` and every 30 s. It is never fatal (fixes `key.rs:29`). A store
+  that exists but won't open gives `store_unreadable` and is never recreated.
 
 ### 2. Protocol v1 (`src/proto.rs`)
 
-One JSON object per line. The maximum line is 1 MiB; a longer line closes that client.
+One JSON object per line, 1 MiB at most. A longer line, or a client whose outgoing queue
+passes 1000 lines, is disconnected. It reconnects and starts over from `hello`.
 
-- **Request** `{"id": 7, "method": "send", "params": {...}}`, then **reply**
-  `{"id": 7, "ok": true, "data": {...}}` or
-  `{"id": 7, "ok": false, "error": {"code": "not_paired", "message": "..."}}`.
-- **Event** `{"event": "message", "data": {...}}`. The first line on every connection is
-  `hello`: `{"protocol": 1, "version": "v1.3.6+…", "state": "...", "unread": N}`.
-- A malformed line or an unknown method gets an error reply (`bad_request`,
-  `unknown_method`). The client stays connected.
-- **Error codes** are stable strings that the plugin translates: `not_paired`,
-  `locked`, `keyring_missing`, `store_unreadable`, `phone_offline`, `send_uncertain`,
-  `not_found`, `bad_request`, `unknown_method`, `busy`, `internal`.
+- **Handshake:**
+  - The daemon sends `{"event":"hello","data":{"protocol":1,"version":"v1.3.6+…",
+    "state":"…","detail":null,"unread":N}}`.
+  - The client sends `{"id":0,"method":"hello","params":{"protocol":1,"role":"app|bar|service"}}`.
+  - On a protocol mismatch, either side reports `protocol_mismatch`. The daemon then
+    refuses every other method from that client.
+- **Requests and replies:**
+  - Request: `{"id":N,"method":"…","params":{…}}`.
+  - Reply: `{"id":N,"ok":true,"data":{…}}` or
+    `{"id":N,"ok":false,"error":{"code":"…","message":"…"}}`.
+  - Ids are per connection. The daemon maps (connection, id) to its own global ids
+    toward the phone layer.
+  - A malformed line gets `{"id":null,"ok":false,"error":{"code":"bad_request"}}`.
+  - When a client disconnects, its pending replies are dropped, but their effects (a
+    sent message, say) still reach the store and are broadcast.
+- **Deadlines:** the daemon replies within each method's deadline: `send` 120 s,
+  `media.*` 60 s, `unpair` 30 s, stage c actions 30 s, everything else 15 s. A client
+  waits that deadline plus 5 s.
+- **States:** `starting`, `locked`, `keyring_missing`, `store_unreadable`, `login`,
+  `pairing`, `connecting`, `ready`, `expired`, `fatal`. The `state` event carries
+  `{state, detail}`. A phone-side logout (`phone.rs:835`) becomes `login` with detail
+  `unpaired_remotely`.
+- **Error codes:** `not_paired`, `locked`, `phone_offline`, `send_rejected`,
+  `send_uncertain`, `not_found`, `bad_request`, `unknown_method`, `protocol_mismatch`,
+  `busy`, `timeout`, `internal`.
 
-**States:** `starting`, `locked`, `login` (not paired), `pairing`, `connecting`,
-`ready`, `expired` (sign in again), `fatal`.
+| Stage | Methods → reply data | Events |
+|-------|----------------------|--------|
+| a | `hello`; `state` → `{state, detail, unread}`; `key.retry`; `pair.start {method: google\|qr\|manual}`; `pair.cancel`; `conversations {folder, offset, limit≤200}` → `{items, total}`; `history {conversation}` → `{messages, truncated}`; `send {conversation, text, reply_to?}` → `{status: sent\|accepted, message}`; `read {conversation}`; `focus {conversation\|null}` | `state`, `pairing {emoji?, qr_svg?, manual_url?, message?}`, `conversation`, `history {conversation, messages}`, `message {conversation, message, notify}`, `missed {count}`, `unread {count}`, `typing` |
+| b | `media.open {message, index}` → `{path}`; `media.save {message, index}` → `{path}`; `react {conversation, message, emoji, op}` | — |
+| c | `contacts {offset, limit}`; `chat.start {numbers}`; `archive`, `restore`, `delete.chat {conversation}`; `delete.message {conversation, message}`; `unpair`; `uninstall` | `gone {conversation}` |
 
-| Stage | Methods | Events |
-|-------|---------|--------|
-| a | `state`, `key.retry`, `pair.start {method: google\|qr\|manual}`, `pair.cancel`, `conversations {folder}`, `history {conversation, before?}`, `send {conversation, text, reply_to?}`, `read {conversation}`, `ui.focus {conversation\|null}` | `hello`, `state`, `pairing {emoji?, qr_svg?, manual_url?, error?}`, `conversation`, `message {conversation, message, notify}`, `typing`, `status` |
-| b | `media.open {message, index}` → `{path}`, `media.save {message, index}` → `{path}`, `react {message, emoji, op}` | `downloaded` |
-| c | `contacts`, `chat.start {numbers}`, `archive`, `restore`, `delete.chat`, `delete.message`, `unpair`, `uninstall` | `gone`, `unpaired` |
+**History:**
+- `history` replies at once from the store, with the last 200 messages and `truncated`
+  if there are more.
+- The phone fetch of the newest messages (`phone.rs:1232`, `HISTORY_COUNT`) lands later
+  as a `history` event.
+- Older messages beyond the store stay out of scope, as in the TUI: there is no paging
+  cursor in the phone layer to build on.
 
-Secrets never reach QML:
-- The DTOs have no cookie, key, token or media-key fields. A unit test serializes every
-  DTO from a fixture full of secrets and checks that none of them appear.
-- Google sign-in runs in the backend's own window. The manual fallback is the existing
-  localhost page (`src/web.rs`): the window shows its URL, and the cookies go from the
-  browser straight to the backend.
-- Media is decrypted into `runtime/media/<sha256(message,index)>.<ext>` (0600). The window
-  loads it with `file://`. `media.save` copies it atomically into the XDG Downloads
-  directory and never overwrites a file there. The runtime dir is tmpfs and is cleared
-  on stop.
+**Secrets never reach QML:**
+- The DTOs have no cookie, key, token or media-key fields. A unit test fills every
+  source type with marker secrets, serializes each DTO, and checks that no marker
+  appears.
+- Google sign-in runs in the backend's window. The manual URL is shown in the window,
+  and the cookies go from the browser straight to the backend.
+- Media is decrypted into `runtime/media/<sha256(message,index)>.<ext>` (0600) and loaded
+  with `file://`. `media.save` copies it atomically into the XDG Downloads directory and
+  never overwrites a file there.
 
-`message.notify` is true only for a live incoming message from someone else that isn't
-`old`, isn't missed-history replay and isn't from me, and whose conversation isn't the one
-`ui.focus` reports as open and focused. The backend decides this once, so the three QML
-clients agree. `unread` is the number of inbox conversations with the phone's `unread`
-flag (`phone::Conversation.unread`).
+**Notifications and unread:**
+- `message.notify` is true only when all of these hold:
+  - the message is live (`old: false`) and new to the store (`known: false`);
+  - it isn't deleted and isn't from me;
+  - no client's current `focus` names its conversation.
+- Focus belongs to the connection that set it and is cleared when that connection drops.
+- Missed messages after a reconnect give one `missed {count}` event, not one per message.
+- `unread` counts inbox conversations whose stored `unread` flag is set. It is correct
+  offline from the store, and it is re-sent whenever it changes.
 
 ### 3. Plugin `olafkfreund.gmessages` (`plugin/`)
 
-The same shape as `nixarchy.meetingai`:
-- `manifest.json`: kinds `service`, `bar-widget`, `panel`. Category "Communication",
-  default section right.
+The same file shape as `nixarchy.meetingai`:
+- `manifest.json`: kinds `service`, `bar-widget`, `panel`; license AGPL-3.0-only;
+  category "Communication".
 - `Client.qml`: Quickshell.Io `Socket` to `$XDG_RUNTIME_DIR/gmessages-tui/daemon.sock`.
-  Reconnect with backoff, `send(method, params, cb)` with id correlation and a 15 s reply
-  timeout, `protocol !== 1` turned into a visible mismatch state.
-- `Service.qml`: one Client. On `message.notify` it runs
-  `notify-send -a Messages -A open=Open <sender> <text>`; Open shows the window on that
-  conversation. It also exposes the IPC target `olafkfreund.gmessages` with `toggle`
-  and `open <conversation>`.
-- `BarWidget.qml`: an icon with the unread badge. Its states (not paired, locked,
-  offline) get distinct icons. Click toggles the window.
-- `App.qml`: a `FloatingWindow` with the app id `olafkfreund.gmessages`, made of
-  `ConversationList.qml`, `Thread.qml`, `Composer.qml`, `PairView.qml`, `HelpOverlay.qml`
-  and `Confirm.qml`. A narrow window shows one column, a wide one shows two.
-- `Theme.qml`: the meetingai approach (`qs.Commons` `Style`: fonts, spacing,
-  `Style.cornerRadius`, colors), so theme, accent and rounding follow live.
-- Strings: every visible string goes through the shell's `I18n`, like first-party
-  plugins. English is the only language shipped. Backend error codes map to translated
-  strings in `Errors.js`.
-- Keys: `j`/`k` or arrows move, `Enter` opens, `i` composes, `Ctrl+Enter` sends, `Esc`
-  goes back or closes, `/` filters, `?` shows the shortcuts, `q` closes the window.
-  Destructive actions (stage c) go through `Confirm.qml`.
+  It does the handshake, keeps a per-method deadline for each pending id, reconnects with
+  backoff, and shows a protocol mismatch as a visible state.
+- `Service.qml`: one Client, role `service`.
+  - On `message.notify` or `missed`, it runs `@notifySend@ -a Messages -A open=Open --
+    <sender> <text>` as a `Process`, at most 3 at a time. `@notifySend@` is substituted
+    with the libnotify path at build time.
+  - The Open action shows the window on that conversation.
+  - It owns the IPC target `olafkfreund.gmessages` (`toggle`, `open <conversation>`).
+- `BarWidget.qml`: an icon with the unread badge. The not paired, locked and offline
+  states get distinct icons. Click toggles the window.
+- `App.qml`: a `FloatingWindow` with the app id `olafkfreund.gmessages`. It contains
+  `ConversationList`, `Thread`, `Composer`, `PairView`, `HelpOverlay` and `Confirm`: one
+  column when narrow, two when wide. It sends `focus` while a thread is open and the
+  window is active.
+- `Theme.qml`: the meetingai approach (`qs.Commons` `Style`), so fonts, spacing,
+  `Style.cornerRadius` and colors follow live.
+- Strings go through the shell's `I18n`, with English only. Backend codes map to strings
+  in `Errors.js`.
+- Keys: `j`/`k` or arrows, `Enter` opens, `i` composes, `Ctrl+Enter` sends, `Esc` goes
+  back or closes, `/` filters, `?` shows the shortcuts, `q` closes. Stage c's destructive
+  actions go through `Confirm`.
 
-### 4. Nix (`flake.nix`, `nix/`)
+### 4. Nix
 
-- `nix/package.nix`: `rustPlatform.buildRustPackage` with `cargoLock.lockFile` (plus
-  `outputHashes` for any remaining git dependency).
+- **`nix/package.nix`:** `rustPlatform.buildRustPackage` with `cargoLock.lockFile`.
   - `nativeBuildInputs`: `pkg-config`, `wrapGAppsHook3`, `perl`.
   - `buildInputs`: `openssl`, `dbus`, `gtk3`, `webkitgtk_4_1`, `libsoup_3`,
     `glib-networking`.
-  - Tests run with `doCheck` (`cargo test --workspace`). Any test that needs the network
-    or a display is skipped by name, with the reason in a comment.
-- `nix/plugin.nix`: copies `plugin/` to `$out`, and its check runs `qmllint` with the
-  Quickshell import paths.
-- `nix/hm-module.nix` (`homeManagerModules.default`), option `services.gmessages`:
+  - `doCheck` runs `cargo test --workspace`. Each skipped test is named, with its reason.
+- **`nix/plugin.nix`:** copies `plugin/`, substitutes `@notifySend@`, and checks that
+  every QML file parses. It uses `qmllint` with unresolved imports allowed, because
+  `qs.Commons` exists only inside the running shell. Loading for real is checked on
+  p620.
+- **`nix/hm-module.nix`** (`homeManagerModules.default`), `services.gmessages`:
   - `enable`, `package`;
+  - `home.packages = [ package ]`;
   - a `systemd.user.services.gmessages-tui` running `serve`, with
-    `PartOf`/`WantedBy=graphical-session.target` (so the sign-in window gets
-    `WAYLAND_DISPLAY`), `Restart=on-failure`, and no hardening that would break WebKit's
-    bubblewrap sandbox;
-  - `programs.nixarchy.plugins."olafkfreund.gmessages".src` when that option exists,
-    else `xdg.configFile."omarchy/plugins/olafkfreund.gmessages"`.
-- `flake.nix` outputs:
-  - `packages.x86_64-linux.{default, gmessages-tui, plugin}`, `overlays.default`;
-  - `homeManagerModules.default`, `devShells.default`;
-  - `checks`: the package with its tests, the plugin with qmllint, the protocol
-    integration test.
-  - nixpkgs: `nixos-unstable`, as p620 uses.
-- The protocol integration test is `tests/serve.rs`, run inside the package's
-  `cargo test`. It starts `serve` with temp XDG dirs and `GMESSAGES_TUI_PASSPHRASE`, then
-  checks:
-  - `hello` arrives, with state `login`;
-  - a malformed line gets an error reply and the client stays connected;
-  - a second `serve` is refused;
-  - SIGTERM removes the socket.
-
-  `Sync` gets unit tests that drive `phone::Event`s through `Commands::detached()`
-  (`src/phone.rs:391`), checking the `notify` rules and that history replay is quiet.
+    `PartOf`/`After`/`WantedBy=graphical-session.target`, `RuntimeDirectory=gmessages-tui`,
+    `Restart=on-failure`, and no sandboxing options that would stop WebKit's bubblewrap.
+- **`flake.nix`:** input `nixpkgs` (nixos-unstable). Outputs:
+  - `packages.x86_64-linux.{default, gmessages-tui, plugin}`;
+  - `overlays.default`, `homeManagerModules.default`, `devShells.default`;
+  - `checks`: package with tests, plugin parse.
+- **Tests** (inside the package's `cargo test`):
+  - `tests/serve.rs` starts the real binary with temp XDG dirs and
+    `GMESSAGES_TUI_PASSPHRASE`, then checks:
+    - the handshake, and state `login`;
+    - a malformed line gets an error and the client stays connected;
+    - a protocol mismatch is refused;
+    - a second instance is refused;
+    - a stale socket left by `kill -9` is recovered on the next start;
+    - SIGTERM removes the socket and the media.
+  - Unit tests in `sync.rs` feed `phone::Event` values straight into `Sync`, using the
+    `#[cfg(test)]` `Commands::detached()` to capture what it asks the phone. They check
+    the notify rules, that history replay and updates of known messages stay quiet, the
+    `missed` summary, and the `unread` count.
+  - `proto.rs` has the secrets test. `key.rs` and `codec.rs` have the bug-fix tests.
 
 ### 5. Bug fixes (intent)
 
-- `src/key.rs`: refuse an empty passphrase. A failing `set_password` gives `locked` or
-  `keyring_missing`, not an abort. Unit tests cover both.
-- `gmessages-proto/src/codec.rs:61`: truncate on a char boundary. A unit test with 21
-  "é" characters covers it.
+- `src/key.rs`: as in section 1 (empty passphrase refused; no abort on a keyring
+  failure).
+- `gmessages-proto/src/codec.rs:61`: truncate on a char boundary, with a test using 21
+  "é" characters.
 
 ## Alternatives rejected
 
-- **stdin/stdout child of `Service.qml` (omamail):** the bar widget and the window
-  would have to go through the service's instance, and a plugin reload would kill the
-  Google session.
-- **D-Bus API:** more code than NDJSON. Quickshell has a native `Socket`, and the owner's
-  meetingai already proves this transport.
-- **Serializing `phone::Event`/`Command` directly:** leaks cookies and media keys.
-- **Keeping the TUI in the build:** the owner chose plugin only, and dropping it removes
-  a git dependency and the terminal prompt.
-- **Standalone Qt C++ app (omarchy-app pattern):** more code, and it doesn't live in the
-  bar.
+- **stdin/stdout child of `Service.qml` (omamail):** the bar and the window would go
+  through one instance, and a plugin reload would drop the Google session.
+- **D-Bus API:** more code than NDJSON. Quickshell has `Socket`, and meetingai proves
+  the transport.
+- **Serializing `phone::Event`/`Command`:** leaks cookies and media keys.
+- **Notifications from the backend over D-Bus:** a new dependency, and the shell's own
+  notify path is already proven by meetingai.
+- **Keeping CLI `--unpair`/`--uninstall`:** they would race the daemon for the store.
+- **Nixarchy options inside the flake's module, or the nixarchy flake as an input for
+  qmllint:** this couples the flake to one desktop and adds a heavy input. The host
+  module sets the plugin option instead, and the real load is checked on p620.
+- **History paging:** there's no cursor in the phone layer, and the TUI doesn't page
+  either.
 
 ## Risks
 
-- **Google refuses the embedded window:** the window falls back to the manual localhost
-  page (it already exists). Checked by hand on p620.
-- **Sign-in window from a systemd user service:** it depends on uwsm having exported
-  `WAYLAND_DISPLAY`, `DBUS_SESSION_BUS_ADDRESS` and `XDG_RUNTIME_DIR` to the user manager.
-  Checked by hand on p620 in stage a; if it fails, the unit gets `PassEnvironment`.
-- **Keyring locked at login, before the service starts:** handled by the `locked`
-  state and the retry.
-- **Quickshell `Socket` and long lines:** history replies can be large. The backend pages
-  history (50 messages per reply), and the client checks that a 1 MiB line parses.
-- **Fork divergence:** `main.rs` is largely replaced, so upstream merges into `src/` will
-  conflict. The bug reports go upstream; this fork carries its own path from here.
-- **Plugin API drift:** first-party Commons (`Style`, `I18n`) can change with nixarchy
-  updates, as for every third-party plugin. qmllint in `checks` catches renamed
-  imports at build time.
-- **Data:** there is no existing state on p620 (`~/.local/share/gmessages-tui` is absent),
-  so no migration risk there. The paths stay the TUI's for anyone else.
+- **Google refuses the embedded window:** the manual localhost page is the fallback.
+  Checked by hand.
+- **Sign-in window from a systemd user unit:** it needs `WAYLAND_DISPLAY` and the session
+  bus in the user manager. Checked on p620 in stage a with `systemctl --user
+  show-environment` before relying on it.
+- **Keyring locked at login:** the `locked` state and the retry.
+- **The real Quickshell `Socket` line limit:** unknown. Stage a tests a 1 MiB line
+  through the real Client on p620.
+- **Fork divergence:** `main.rs` and `pair.rs` change heavily. Upstream bug reports are a
+  separate follow-up, not part of these plans.
+- **Plugin API drift** (`qs.Commons`): only caught when the plugin loads on p620. Each
+  stage's check includes the shell journal.
+- **Data:** p620 has no existing state, so there is no migration risk there.
 
 ## Verification
 
@@ -233,19 +286,21 @@ nix build .#gmessages-tui .#plugin
 nix run . -- --version
 ```
 
-On p620, by hand with the owner, after each stage's home-manager switch:
+On p620, after a `nixos-rebuild switch` of `~/.config/nixos`. The owner OKs each
+switch, and the checks are done together:
 
-1. The user unit `gmessages-tui` is active.
-2. `omarchy-shell shell listPlugins` shows `olafkfreund.gmessages` enabled.
-3. Pairing works: the sign-in window opens, the emoji shows in the window, and the phone
+1. The user unit is active. Its environment has `WAYLAND_DISPLAY`.
+2. `omarchy-shell shell listPlugins` shows `olafkfreund.gmessages` enabled and active,
+   and the shell journal shows no QML errors for it.
+3. Pairing: the sign-in window opens, the emoji shows in the window, and the phone
    accepts it. The manual URL works when the sign-in window is refused.
 4. The conversation list and history load. A message is sent and shows up on the phone.
-   A reply from the phone notifies once, and not while that thread is focused.
-5. After the unit is started again, and after the machine boots again, everything
-   reopens without pairing.
-6. Locking the keyring before the unit starts shows `locked` in the window, and
-   unlocking with retry recovers.
-7. A theme switch and a rounding change apply live to the window and the badge.
-8. Stage b: an image opens and saves. A reaction appears on the phone.
+   A phone reply notifies once, and not while its thread is focused. The badge counts
+   unread conversations and drops after reading.
+5. After the unit starts again, and after the machine boots again, everything reopens
+   without pairing.
+6. A locked keyring shows `locked`, and unlocking with retry recovers.
+7. A theme switch and a rounding change apply live.
+8. Stage b: an image opens and saves. A reaction reaches the phone.
 9. Stage c: a new chat starts. Archive and restore work, and delete asks first. Unpair
    keeps the store; uninstall removes everything.
