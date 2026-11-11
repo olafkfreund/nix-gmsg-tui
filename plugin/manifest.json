@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "olafkfreund.gmessages",
+  "name": "Messages",
+  "version": "0.1.0",
+  "author": "Olaf K. Freund",
+  "license": "AGPL-3.0-only",
+  "description": "Google Messages client for Omarchy.",
+  "kinds": [
+    "service",
+    "bar-widget",
+    "panel"
+  ],
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml",
+    "panel": "App.qml"
+  },
+  "barWidget": {
+    "displayName": "Messages",
+    "category": "Communication",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
