@@ -6,10 +6,18 @@
 use std::error::Error;
 use std::path::Path;
 
-use chat_tui::data::Attachment;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::phone;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Attachment {
+    pub content_type: String,
+    pub file_name: Option<String>,
+    pub bytes: Vec<u8>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+}
 
 /// Version of the schema, in `PRAGMA user_version`.
 const SCHEMA: i64 = 5;
@@ -26,9 +34,7 @@ pub struct Conversation {
     pub id: String,
     pub name: String,
     pub group: bool,
-    #[allow(dead_code, reason = "used by the wire DTO in step 4")]
     pub timestamp_ms: i64,
-    #[allow(dead_code, reason = "used by the wire DTO in step 4")]
     pub unread: bool,
     /// Gone from the phone (deleted).
     pub hidden: bool,
@@ -232,7 +238,6 @@ impl Store {
             .map(Option::flatten)
     }
 
-    #[allow(dead_code, reason = "used by Sync in step 5")]
     pub fn set_unread(&self, id: &str, unread: bool) -> rusqlite::Result<()> {
         self.conn
             .execute(
@@ -242,7 +247,6 @@ impl Store {
             .map(|_| ())
     }
 
-    #[allow(dead_code, reason = "used by Sync in step 5")]
     pub fn unread_count(&self) -> rusqlite::Result<i64> {
         self.conn.query_row(
             "SELECT count(*) FROM conversations WHERE folder IS NULL AND hidden = 0 AND unread = 1",

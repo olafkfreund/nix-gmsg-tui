@@ -12,7 +12,6 @@ use std::time::{Duration, Instant};
 use futures::StreamExt;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use gmessages_proto as gm;
-pub use gmessages_proto::ReactionOp;
 use serde::{Deserialize, Serialize};
 
 /// What the phone reports.

@@ -9,25 +9,23 @@ readme = "README.md"
 keywords = ["google-messages", "rcs", "sms", "tui", "terminal"]
 categories = ["command-line-utilities"]
 build = "build.rs"
+autoexamples = false
 include = ["/src", "/build.rs", "/examples/wry_signin.rs", "/README.md", "/LICENSE"]
 
 [workspace]
 members = ["gmessages-proto"]
 
 [dependencies]
-# The interface, shared with signal-tui.
-chat-tui = { package = "chat-tui-core", git = "https://github.com/louisrubet/chat-tui-core", tag = "v1.12.1", version = "1.12.1" }
 chrono = "0.4"
-crossterm = "0.28"
 base64 = "0.22"
+dirs = "7"
 futures = "0.3"
 getrandom = "0.3"
 # Google Messages for web: the protocol.
 gmessages-proto = { path = "gmessages-proto", version = "0.1.0" }
-# The store: SQLCipher (with the system OpenSSL), its key in the OS keyring, a passphrase
-# prompt as a fallback.
+# The store: SQLCipher (with the system OpenSSL), its key in the OS keyring.
 keyring = "4.2"
-rpassword = "7.5"
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 rusqlite = { version = "0.40", features = ["bundled-sqlcipher"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

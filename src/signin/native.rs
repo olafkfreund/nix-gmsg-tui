@@ -17,14 +17,10 @@ pub struct Native {
 }
 
 impl Native {
-    pub fn start(intro: &str) -> io::Result<Self> {
+    pub fn start(_intro: &str) -> io::Result<Self> {
         let mut command = Command::new(std::env::current_exe()?);
         command.arg("--internal-google-signin");
-        let native = Self::spawn(&mut command)?;
-        pair::say(&format!(
-            "{intro}: sign in in the private Google window.\nThe window hides once sign-in completes; tap the emoji printed here on your phone.\nClose the window before then, or press Ctrl+C in the terminal, to cancel. If Google refuses, restart with --manual."
-        ));
-        Ok(native)
+        Self::spawn(&mut command)
     }
 
     fn spawn(command: &mut Command) -> io::Result<Self> {

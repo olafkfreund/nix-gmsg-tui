@@ -1,8 +1,6 @@
 //! The wire protocol v1 between the daemon and its clients: NDJSON, one envelope per line.
 //! These are the only serialized types of the wire; none of them carries a secret, and no
 //! `phone::` type is ever serialized onto it.
-// Step 5 (the `Sync` port) starts using these; step 6 (the daemon) removes this allow.
-#![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -141,6 +139,7 @@ pub struct Conversation {
     pub name: String,
     pub group: bool,
     pub folder: String,
+    pub hidden: bool,
     pub unread: bool,
     pub last_ms: i64,
     pub snippet: String,
@@ -182,6 +181,7 @@ impl Conversation {
             name: c.name.clone(),
             group: c.group,
             folder: folder(&c.folder),
+            hidden: c.deleted,
             unread: c.unread,
             last_ms: c.timestamp_ms,
             snippet: c
@@ -197,6 +197,7 @@ impl Conversation {
             name: c.name.clone(),
             group: c.group,
             folder: folder(&c.folder),
+            hidden: c.hidden,
             unread: c.unread,
             last_ms: c.timestamp_ms,
             snippet: c

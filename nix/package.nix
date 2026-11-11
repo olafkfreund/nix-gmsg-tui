@@ -38,10 +38,6 @@ rustPlatform.buildRustPackage {
 
   cargoLock = {
     lockFile = ../Cargo.lock;
-    outputHashes = {
-      "chat-tui-core-1.12.1" = "sha256-cAcE2uYr2F00hm0zVt0T97gOYXXz/zTOm8j+9yuzxGY=";
-      "emoji-expander-1.2.2" = "sha256-y59lUMALOy7Cc3zxKh+63Q/HH4DldMdgfvzbtaU06bI=";
-    };
   };
 
   nativeBuildInputs = [

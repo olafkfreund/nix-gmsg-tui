@@ -414,6 +414,18 @@ components, `Theme.qml`, `Errors.js`. Details are in step 7.
      chat-tui one, deriving `Debug`, `Clone` and `PartialEq`.
    - `nix/package.nix`: remove the `outputHashes` entries for crates no longer in the
      lock.
+   - Deviations found in implementation (accepted):
+     - `Cargo.toml` `autoexamples = false`, so `examples/demo.rs` (a TUI demo) is no
+       longer built. `wry_signin` stays declared.
+     - The unused `phone::ReactionOp` re-export is removed (stage b brings reactions
+       back).
+     - `getrandom` errors are converted to strings after dependency unification.
+     - `proto::Conversation` gains `hidden`, so a `Gone` event tells clients to drop
+       the conversation.
+     - Both git dependencies left the lock, so `outputHashes` is gone.
+     - Follow-up: `Sync::conversations` reads every stored conversation with its
+       messages to build snippets. If large inboxes are slow, add a store query for the
+       last message per conversation.
    - Tests in `sync.rs` (with `Commands::detached()` and a temp store, plus the ported
      `main.rs` tests):
      - a live new message from someone else notifies;
