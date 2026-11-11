@@ -727,11 +727,28 @@ The final reviews (Opus, Codex, agy) found these; fixed before step 9, by the le
   stays enabled while sending (a disabled field dropped focus); delegates bind through
   their own id, not `parent.modelData`.
 
-Left for stage b (recorded, not fixed): a cap on client count and on the bytes of a
-`history` reply, the `conversations` snippet cost, pairing-cancel racing a new
-pairing, notifications beyond three in flight, list snippets and order on live
-messages, and message text on the `notify-send`
-command line.
+Second round, at the owner's request ("fix the findings"):
+
+- `src/serve.rs`: at most 32 clients, at most 8 MiB queued per client; key errors reach
+  the plugin as codes (`keyring_locked`, `keyring_missing`, `keyring_refused`,
+  `empty_passphrase`) with the reason in the journal; `pair.start` answers `busy` when
+  pairing or paired; closing the sign-in window ends the pairing; a second daemon exits
+  3, which the unit does not restart on (`RestartPreventExitStatus = 3`).
+- **Deviation from step 6:** `read` needs `ready` (it tells the phone) and answers
+  `not_paired` otherwise; `conversations`, `history` and `focus` are served from the
+  store in any state once it is open, so offline reading works while `connecting`.
+- `src/sync.rs`, `src/store.rs`: the list loads one message per conversation; a
+  history line holds at most 768 KiB of messages (newest first, `truncated` set);
+  `missed` counts from the last message seen (a fresh store: from start); a late
+  `cancelled` from an old pairing no longer resets a new one to `login`.
+- `plugin/`: notifications beyond three in flight become one summary when a slot frees;
+  message text is escaped for markup; the list updates snippet, order and unread on
+  live messages; a thread opened from a notification gets its name once the list loads;
+  pairing buttons are hidden while pairing; key details are shown.
+- `nix/package.nix`: `plugin/` is outside the Rust source.
+
+Known limit, kept: `notify-send` takes the text as arguments, so it is in
+`/proc/<pid>/cmdline` while the notification is open (fine on a single-user host).
 
 ## Tests
 

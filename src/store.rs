@@ -131,6 +131,15 @@ impl Store {
 
     /// The conversations, the most recent first, with their last messages in send order.
     pub fn conversations(&self) -> Result<Vec<Conversation>, Box<dyn Error>> {
+        self.conversations_with(LOADED)
+    }
+
+    /// The conversations with only their last message: enough for a list and its snippets.
+    pub fn conversation_list(&self) -> Result<Vec<Conversation>, Box<dyn Error>> {
+        self.conversations_with(1)
+    }
+
+    fn conversations_with(&self, loaded: i64) -> Result<Vec<Conversation>, Box<dyn Error>> {
         let mut conversations = self
             .conn
             .prepare(
@@ -155,7 +164,7 @@ impl Store {
              ORDER BY sent_ms DESC LIMIT ?2) ORDER BY sent_ms",
         )?;
         for conversation in &mut conversations {
-            for data in messages.query_map(params![conversation.id, LOADED], |row| {
+            for data in messages.query_map(params![conversation.id, loaded], |row| {
                 row.get::<_, String>(0)
             })? {
                 conversation.messages.push(serde_json::from_str(&data?)?);

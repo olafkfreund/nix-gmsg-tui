@@ -13,7 +13,6 @@ pub struct Sync {
     store: Rc<store::Store>,
     commands: phone::Commands,
     known: HashSet<String>,
-    read: HashSet<String>,
     looked_up: HashSet<String>,
     fetching: HashSet<String>,
     stopped_ms: Option<i64>,
@@ -23,22 +22,23 @@ pub struct Sync {
 
 impl Sync {
     pub fn new(store: Rc<store::Store>, commands: phone::Commands) -> Self {
-        let stored = store.conversations().unwrap_or_default();
+        let stored = store.conversation_list().unwrap_or_default();
+        // The last message seen; a fresh store starts now, so what arrives later counts as missed.
         let stopped_ms = stored
             .iter()
             .flat_map(|c| c.messages.iter().map(|m| m.timestamp_ms))
-            .max();
-        let read = stored
-            .iter()
-            .filter(|c| !c.unread)
-            .map(|c| c.id.clone())
-            .collect();
+            .max()
+            .or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|d| d.as_millis() as i64)
+            });
         let known = stored.iter().map(|c| c.id.clone()).collect();
         Self {
             store,
             commands,
             known,
-            read,
             looked_up: HashSet::new(),
             fetching: HashSet::new(),
             stopped_ms,
@@ -106,11 +106,6 @@ impl Sync {
         {
             tracing::warn!(%error, "cannot forget conversation");
         }
-        if conversation.unread {
-            self.read.remove(&conversation.id);
-        } else {
-            self.read.insert(conversation.id.clone());
-        }
         self.known.insert(conversation.id.clone());
         vec![Self::event(
             "conversation",
@@ -146,17 +141,17 @@ impl Sync {
         if missed && !self.missed.contains(&message.id) {
             self.missed.push(message.id.clone());
         }
+        if !old {
+            self.stopped_ms = self.stopped_ms.max(Some(message.timestamp_ms));
+        }
         let notify = !old
             && !known
             && !message.deleted
             && !message.from_me
             && !self.focus.values().any(|focused| focused == &conversation);
         let unread_before = self.unread();
-        if notify {
-            self.read.remove(&conversation);
-            if let Err(error) = self.store.set_unread(&conversation, true) {
-                tracing::warn!(%error, "cannot mark conversation unread");
-            }
+        if notify && let Err(error) = self.store.set_unread(&conversation, true) {
+            tracing::warn!(%error, "cannot mark conversation unread");
         }
         let mut out = vec![Self::event(
             "message",
@@ -269,6 +264,8 @@ impl Sync {
                     ..Default::default()
                 },
             )],
+            // pair.cancel already set login; a late "cancelled" must not reset a new pairing.
+            phone::Event::PairFailed { message } if message == "cancelled" => Vec::new(),
             phone::Event::PairFailed { message } => vec![
                 Self::event(
                     "pairing",
@@ -327,15 +324,12 @@ impl Sync {
                     {
                         tracing::warn!(%error, "cannot store history");
                     }
-                    let start = messages.len().saturating_sub(200);
+                    let (messages, _) = fit(&conversation, &messages);
                     out.push(Self::event(
                         "history",
                         &proto::HistoryEvent {
                             conversation: conversation.clone(),
-                            messages: messages[start..]
-                                .iter()
-                                .map(|m| proto::Message::from_phone(&conversation, m, false))
-                                .collect(),
+                            messages,
                         },
                     ));
                 }
@@ -460,7 +454,6 @@ impl Sync {
         if let Err(error) = self.store.set_unread(conversation, false) {
             tracing::warn!(%error, "cannot mark conversation read");
         }
-        self.read.insert(conversation.into());
         if self.unread() != before {
             vec![self.unread_event()]
         } else {
@@ -470,13 +463,9 @@ impl Sync {
 
     pub fn history(&self, conversation: &str) -> proto::HistoryData {
         let messages = self.store.messages(conversation).unwrap_or_default();
-        let truncated = messages.len() > 200;
-        let start = messages.len().saturating_sub(200);
+        let (messages, truncated) = fit(conversation, &messages);
         proto::HistoryData {
-            messages: messages[start..]
-                .iter()
-                .map(|m| proto::Message::from_phone(conversation, m, false))
-                .collect(),
+            messages,
             truncated,
         }
     }
@@ -495,7 +484,7 @@ impl Sync {
         };
         let conversations: Vec<_> = self
             .store
-            .conversations()
+            .conversation_list()
             .unwrap_or_default()
             .into_iter()
             .filter(|c| !c.hidden && c.folder.as_deref() == folder)
@@ -528,6 +517,27 @@ impl Sync {
     }
 }
 
+/// Bytes of messages one history line may carry, well under the daemon's 1 MiB line limit.
+const HISTORY_BYTES: usize = 768 * 1024;
+
+/// The newest messages (at most 200) whose wire form fits [`HISTORY_BYTES`], in send order,
+/// and whether older ones were left out.
+fn fit(conversation: &str, messages: &[crate::phone::Message]) -> (Vec<proto::Message>, bool) {
+    let mut kept = Vec::new();
+    let mut bytes = 0;
+    for m in messages.iter().rev().take(200) {
+        let wire = proto::Message::from_phone(conversation, m, false);
+        bytes += serde_json::to_string(&wire).map_or(0, |s| s.len() + 1);
+        if bytes > HISTORY_BYTES && !kept.is_empty() {
+            break;
+        }
+        kept.push(wire);
+    }
+    let truncated = kept.len() < messages.len();
+    kept.reverse();
+    (kept, truncated)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,6 +550,29 @@ mod tests {
             "sender": "Ann", "text": id, "deleted": deleted
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn history_fits_the_line_limit() {
+        let long = "x".repeat(100 * 1024);
+        let messages: Vec<_> = (0..20)
+            .map(|i| {
+                let mut m = message(&format!("m{i}"), i, false, false);
+                m.text = long.clone();
+                m
+            })
+            .collect();
+        let (kept, truncated) = fit("c", &messages);
+        assert!(truncated);
+        assert!(kept.len() < 20 && !kept.is_empty());
+        assert_eq!(kept.last().unwrap().id, "m19");
+        let bytes: usize = kept
+            .iter()
+            .map(|m| serde_json::to_string(m).unwrap().len())
+            .sum();
+        assert!(bytes <= HISTORY_BYTES);
+        let (all, truncated) = fit("c", &messages[..3]);
+        assert_eq!((all.len(), truncated), (3, false));
     }
 
     fn conversation(unread: bool) -> phone::Conversation {

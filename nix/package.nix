@@ -28,6 +28,7 @@ rustPlatform.buildRustPackage {
       && !(lib.any (dir: relative == dir || lib.hasPrefix "${dir}/" relative) [
         ".git"
         "nix"
+        "plugin"
         "intent"
         "spec"
         "plan"

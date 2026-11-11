@@ -79,7 +79,7 @@ Item {
     }
 
     readonly property bool isLockedState: root.client.state === "locked" || root.client.state === "keyring_missing"
-    readonly property bool canStartPair: root.client.connected && !root.client.mismatch && (root.client.state === "login" || root.client.state === "expired" || root.client.state === "pairing")
+    readonly property bool canStartPair: root.client.connected && !root.client.mismatch && (root.client.state === "login" || root.client.state === "expired")
 
     readonly property string stateText: {
         if (!root.client.connected) {
@@ -87,9 +87,6 @@ Item {
         }
         if (root.client.mismatch) {
             return Errors.format(I18n, "protocol_mismatch", "Daemon protocol mismatch. Please restart the service.");
-        }
-        if (root.client.state === "locked") {
-            return I18n.t("gmessages.unlock_keyring", "Unlock your keyring");
         }
         var base = Errors.format(I18n, root.client.state, root.client.state);
         if (root.client.detail) {

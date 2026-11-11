@@ -77,6 +77,7 @@ Item {
                 root.fetchPage(offset + items.length, merged);
             } else {
                 root.loading = false;
+                root.resolveSelectedName();
             }
         });
     }
@@ -90,7 +91,8 @@ Item {
             if (cur.id === c.id) {
                 found = true;
                 if (!c.hidden && (c.folder === "inbox" || !c.folder)) {
-                    next.push(c);
+                    // A conversation event may come without a snippet; keep the last one known.
+                    next.push(c.snippet ? c : Object.assign({}, c, { snippet: cur.snippet || "" }));
                 }
             } else {
                 next.push(cur);
@@ -101,9 +103,46 @@ Item {
         }
         next.sort(function(a, b) { return (Number(b.last_ms) || 0) - (Number(a.last_ms) || 0); });
         root.allItems = next;
-        if (c.id === root.selectedId && c.name) {
+        if (c.id === root.selectedId && c.name && String(c.name) !== root.selectedName) {
             root.selectedName = String(c.name);
+            root.conversationSelected(root.selectedId, root.selectedName);
         }
+    }
+
+    // Opened before the list loaded (from a notification): give the thread its name now.
+    function resolveSelectedName() {
+        if (root.selectedId === "" || root.selectedName !== "") return;
+        for (var i = 0; i < root.allItems.length; i++) {
+            if (root.allItems[i].id === root.selectedId && root.allItems[i].name) {
+                root.selectedName = String(root.allItems[i].name);
+                root.conversationSelected(root.selectedId, root.selectedName);
+                return;
+            }
+        }
+    }
+
+    // A live or sent message moves its conversation up with a fresh snippet.
+    function noteMessage(convId, msg, notify) {
+        if (!msg || msg.deleted) return;
+        var next = [];
+        var found = false;
+        for (var i = 0; i < root.allItems.length; i++) {
+            var c = root.allItems[i];
+            if (c.id === convId) {
+                found = true;
+                var t = Number(msg.timestamp_ms) || 0;
+                next.push(Object.assign({}, c, {
+                    snippet: String(msg.text || "").slice(0, 80),
+                    last_ms: Math.max(Number(c.last_ms) || 0, t),
+                    unread: c.unread || notify === true
+                }));
+            } else {
+                next.push(c);
+            }
+        }
+        if (!found) return;
+        next.sort(function(a, b) { return (Number(b.last_ms) || 0) - (Number(a.last_ms) || 0); });
+        root.allItems = next;
     }
 
     function markReadLocal(convId) {
@@ -193,6 +232,9 @@ Item {
         }
         function onConversationChanged(c) {
             root.upsertConversation(c);
+        }
+        function onMessageArrived(conv, msg, notify) {
+            root.noteMessage(conv, msg, notify);
         }
     }
 

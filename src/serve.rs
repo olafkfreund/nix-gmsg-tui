@@ -1,5 +1,6 @@
 //! One local daemon owns the encrypted store and fans phone events out to socket clients.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -23,6 +24,12 @@ use crate::{VERSION, key, pair, paths, phone, proto, store, sync};
 
 const MAX_LINE: usize = 1024 * 1024;
 const QUEUE: usize = 1000;
+/// Bytes waiting for one client; a client that falls further behind is dropped.
+const MAX_QUEUED: usize = 8 * 1024 * 1024;
+/// Same-user clients served at once: the shell's service, bar widget and window, with room.
+const MAX_CLIENTS: usize = 32;
+/// Exit status when another daemon holds the lock; the unit does not restart on it.
+pub const ALREADY_RUNNING: u8 = 3;
 
 enum Incoming {
     Line(u64, String),
@@ -42,6 +49,7 @@ enum PairStatus {
 
 struct Client {
     tx: mpsc::Sender<String>,
+    queued: Rc<Cell<usize>>,
     reader: JoinHandle<()>,
     writer: JoinHandle<()>,
     handshaken: bool,
@@ -85,7 +93,11 @@ pub fn run() -> ExitCode {
     let result = tokio::task::LocalSet::new().block_on(&runtime, serve());
     if let Err(error) = result {
         eprintln!("{error}");
-        ExitCode::FAILURE
+        if error.kind() == io::ErrorKind::AlreadyExists {
+            ExitCode::from(ALREADY_RUNNING)
+        } else {
+            ExitCode::FAILURE
+        }
     } else {
         ExitCode::SUCCESS
     }
@@ -146,7 +158,9 @@ async fn serve_bound(listener: UnixListener, data: PathBuf, _media: &Path) -> io
         tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
-                    if stream.peer_cred().is_ok_and(|c| c.uid() == unsafe { libc::geteuid() }) {
+                    if daemon.clients.len() < MAX_CLIENTS
+                        && stream.peer_cred().is_ok_and(|c| c.uid() == unsafe { libc::geteuid() })
+                    {
                         daemon.accept(stream);
                     }
                 }
@@ -225,15 +239,20 @@ impl Daemon {
                     }
                     _ => proto::State::Locked,
                 };
+                // A code the plugin can translate; the reason goes to the journal.
+                eprintln!("store key: {error}");
                 let detail = match error {
-                    key::KeyError::Empty => "empty_passphrase".to_owned(),
-                    _ => error.to_string(),
+                    key::KeyError::Empty => "empty_passphrase",
+                    key::KeyError::Locked(_) => "keyring_locked",
+                    key::KeyError::Missing(_) => "keyring_missing",
+                    key::KeyError::Refused(_) => "keyring_refused",
                 };
-                self.set_state(state, Some(detail));
+                self.set_state(state, Some(detail.to_owned()));
                 return;
             }
             Err(error) => {
-                self.set_state(proto::State::KeyringMissing, Some(error.to_string()));
+                eprintln!("store key: {error}");
+                self.set_state(proto::State::KeyringMissing, Some("keyring_missing".into()));
                 return;
             }
         };
@@ -261,7 +280,10 @@ impl Daemon {
                     }
                 });
             }
-            Err(error) => self.set_state(proto::State::StoreUnreadable, Some(error.to_string())),
+            Err(error) => {
+                eprintln!("store: {error}");
+                self.set_state(proto::State::StoreUnreadable, None);
+            }
         }
     }
 
@@ -270,6 +292,8 @@ impl Daemon {
         self.next_conn += 1;
         let (mut read, mut write) = stream.into_split();
         let (tx, mut rx) = mpsc::channel::<String>(QUEUE);
+        let queued = Rc::new(Cell::new(0usize));
+        let drained = queued.clone();
         let hello = proto::EventLine::new(
             "hello",
             &proto::HelloEvent {
@@ -283,6 +307,7 @@ impl Daemon {
         let _ = tx.try_send(serde_json::to_string(&hello).expect("hello serializes"));
         let writer = tokio::task::spawn_local(async move {
             while let Some(line) = rx.recv().await {
+                drained.set(drained.get().saturating_sub(line.len()));
                 if write.write_all(line.as_bytes()).await.is_err()
                     || write.write_all(b"\n").await.is_err()
                 {
@@ -320,6 +345,7 @@ impl Daemon {
             conn,
             Client {
                 tx,
+                queued,
                 reader,
                 writer,
                 handshaken: false,
@@ -344,13 +370,16 @@ impl Daemon {
             self.close(conn);
             return;
         };
-        if line.len() > MAX_LINE
+        let len = line.len();
+        if len > MAX_LINE
             || self
                 .clients
                 .get(&conn)
-                .is_some_and(|c| c.tx.try_send(line).is_err())
+                .is_some_and(|c| c.queued.get() + len > MAX_QUEUED || c.tx.try_send(line).is_err())
         {
             self.close(conn);
+        } else if let Some(c) = self.clients.get(&conn) {
+            c.queued.set(c.queued.get() + len);
         }
     }
 
@@ -481,7 +510,14 @@ impl Daemon {
                         ..Default::default()
                     },
                 )),
-                pair::Pasted::Quit => {}
+                // The sign-in window was closed: the pairing is over, as with pair.cancel.
+                pair::Pasted::Quit => {
+                    self.pairing = None;
+                    self.pair_status = None;
+                    if self.state == proto::State::Pairing {
+                        self.set_state(proto::State::Login, None);
+                    }
+                }
             },
             Incoming::Line(conn, line) => self.request(conn, &line).await,
         }
@@ -583,19 +619,22 @@ impl Daemon {
                 if let Some(commands) = &self.commands {
                     commands.send(phone::Command::CancelPairing);
                 }
-                if self.state == proto::State::Pairing || self.pairing.is_some() {
+                if self.state == proto::State::Pairing {
                     self.set_state(proto::State::Login, None);
                 }
             }
             "pair.start" => {
-                if self.state == proto::State::Pairing {
+                let busy = if self.state == proto::State::Pairing || self.pairing.is_some() {
+                    Some("pairing already in progress")
+                } else if self.state == proto::State::Ready {
+                    Some("already paired")
+                } else {
+                    None
+                };
+                if let Some(message) = busy {
                     self.write(
                         conn,
-                        &proto::Reply::err(
-                            Some(id),
-                            proto::ErrorCode::Busy,
-                            "pairing already in progress",
-                        ),
+                        &proto::Reply::err(Some(id), proto::ErrorCode::Busy, message),
                     );
                     return;
                 }
@@ -640,6 +679,11 @@ impl Daemon {
                     Ok(_) => Err("conversation required".into()),
                     Err(e) => Err(e),
                 }
+            }
+            // Tells the phone, so unlike the store reads it needs a connection.
+            "read" if self.state != proto::State::Ready => {
+                self.write(conn, &self.unready(Some(id)));
+                return;
             }
             "read" => {
                 reply = match params::<proto::ConversationParams>(request.params) {
@@ -818,7 +862,10 @@ fn lock(path: &Path) -> io::Result<File> {
         let _ = file.read_to_string(&mut pid);
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
-            format!("already running (pid {})", pid.trim()),
+            match pid.trim() {
+                "" => "already running".to_owned(),
+                pid => format!("already running (pid {pid})"),
+            },
         ));
     }
     file.set_len(0)?;

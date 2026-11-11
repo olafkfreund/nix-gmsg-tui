@@ -27,6 +27,8 @@ var messages = {
     "expired": "Session expired. Please pair again.",
     "fatal": "The background service encountered a fatal error.",
     "empty_passphrase": "Store passphrase is empty.",
+    "keyring_locked": "Unlock your keyring",
+    "keyring_refused": "The keyring refused to store the key.",
     "unpaired_remotely": "Unpaired from your phone.",
     "cancelled": "Pairing cancelled."
 };

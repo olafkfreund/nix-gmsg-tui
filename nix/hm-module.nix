@@ -34,6 +34,8 @@ in
         RuntimeDirectoryMode = "0700";
         Restart = "on-failure";
         RestartSec = 5;
+        # 3: another gmessages-tui serve holds the lock; restarting would only loop.
+        RestartPreventExitStatus = 3;
       };
       Install.WantedBy = [ "graphical-session.target" ];
     };

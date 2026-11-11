@@ -209,7 +209,7 @@ fn one_instance_stale_socket_and_sigterm_cleanup() {
     fixture.start();
     fixture.connect().hello();
     let second = fixture.command().output().unwrap();
-    assert_eq!(second.status.code(), Some(1));
+    assert_eq!(second.status.code(), Some(3));
     assert!(String::from_utf8_lossy(&second.stderr).contains("already running"));
 
     fixture.signal(libc::SIGKILL);

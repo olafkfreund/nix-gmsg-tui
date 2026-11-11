@@ -47,22 +47,65 @@ Item {
         Process {
             id: proc
             property string targetConversation: ""
-            property string collectedOut: ""
+            // Destroyed only once both the exit and the action on stdout are in.
+            property bool exitedDone: false
+            property bool streamDone: false
+            function finish() {
+                if (!proc.exitedDone || !proc.streamDone) return;
+                root.runningNotifications = Math.max(0, root.runningNotifications - 1);
+                root.flushDropped();
+                proc.destroy();
+            }
             stdout: StdioCollector {
                 onStreamFinished: {
-                    proc.collectedOut = String(text).trim();
-                    if (proc.collectedOut === "open") {
+                    if (String(text).trim() === "open") {
                         root.openWindow(proc.targetConversation);
                     }
+                    proc.streamDone = true;
+                    proc.finish();
                 }
             }
             onExited: {
-                root.runningNotifications = Math.max(0, root.runningNotifications - 1);
-                proc.destroy();
+                proc.exitedDone = true;
+                proc.finish();
+                // A notify-send that never started may not finish its stream.
+                if (!proc.streamDone) graceTimer.createObject(root, { target: proc });
             }
         }
     }
 
+    Component {
+        id: graceTimer
+        Timer {
+            property var target: null
+            interval: 1000
+            running: true
+            onTriggered: {
+                if (target && !target.streamDone) {
+                    target.streamDone = true;
+                    target.finish();
+                }
+                destroy();
+            }
+        }
+    }
+
+    // Notifications over the three in flight become one summary as soon as a slot frees.
+    function flushDropped() {
+        if (root.droppedNotifications <= 0 || root.runningNotifications >= 3) return;
+        var total = root.droppedNotifications;
+        root.droppedNotifications = 0;
+        var summary = I18n.tn("gmessages.missed_messages", total, total + " new messages").replace("%n", String(total));
+        root.spawnNotify(I18n.t("gmessages.app_name", "Messages"), summary, "");
+    }
+
+    // Notification servers render body markup; message text is shown as written.
+    function plain(text) {
+        return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    }
+
+    // shortcut: notify-send takes the text as arguments, so it is in /proc/<pid>/cmdline
+    // while the notification is open; a D-Bus client would avoid it on multi-user hosts.
     function spawnNotify(title, body, conv) {
         root.runningNotifications += 1;
         notifyProc.createObject(root, {
@@ -72,7 +115,7 @@ Item {
                 "-A", "open=" + I18n.t("gmessages.action_open", "Open"),
                 "--",
                 title,
-                body
+                root.plain(body)
             ],
             targetConversation: conv || "",
             running: true
