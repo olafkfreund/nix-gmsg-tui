@@ -13,7 +13,6 @@ FloatingWindow {
     property var manifest: null
 
     title: I18n.t("gmessages.app_name", "Messages")
-    appId: "olafkfreund.gmessages"
     implicitWidth: 920
     implicitHeight: 640
     minimumSize: Qt.size(420, 380)
