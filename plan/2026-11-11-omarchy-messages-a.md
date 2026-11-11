@@ -707,7 +707,7 @@ components, `Theme.qml`, `Errors.js`. Details are in step 7.
 
 ## Review fixes (after step 8)
 
-The final reviews (Opus, Codex) found these; fixed before step 9, by the lead:
+The final reviews (Opus, Codex, agy) found these; fixed before step 9, by the lead:
 
 - `src/serve.rs`: the key lookup runs off the loop and reports back as an event (a
   Secret Service unlock prompt waits without a time limit, which froze the daemon);
@@ -723,10 +723,14 @@ The final reviews (Opus, Codex) found these; fixed before step 9, by the lead:
   window regains focus. `plugin/Composer.qml`: drafts are kept per conversation.
 - `nix/plugin.nix`: the `@notifySend@` check uses `if grep`, since `! grep` never
   fails under errexit.
+- From the agy review: a paired store starts in `connecting`, not `login`; the composer
+  stays enabled while sending (a disabled field dropped focus); delegates bind through
+  their own id, not `parent.modelData`.
 
 Left for stage b (recorded, not fixed): a cap on client count and on the bytes of a
 `history` reply, the `conversations` snippet cost, pairing-cancel racing a new
-pairing, notifications beyond three in flight, and message text on the `notify-send`
+pairing, notifications beyond three in flight, list snippets and order on live
+messages, and message text on the `notify-send`
 command line.
 
 ## Tests

@@ -239,12 +239,19 @@ impl Daemon {
         };
         match store::Store::open(&self.data.join("messages.db"), &key) {
             Ok(store) => {
-                let phone = phone::Phone::start(&self.data.join("session.json"));
+                let session = self.data.join("session.json");
+                // Paired before: connecting, so the plugin does not flash "sign in".
+                let state = if session.exists() {
+                    proto::State::Connecting
+                } else {
+                    proto::State::Login
+                };
+                let phone = phone::Phone::start(&session);
                 let (mut events, commands, control) = phone.split();
                 self.sync = Some(sync::Sync::new(Rc::new(store), commands.clone()));
                 self.commands = Some(commands);
                 self.control = Some(control);
-                self.set_state(proto::State::Login, None);
+                self.set_state(state, None);
                 let tx = self.tx.clone();
                 tokio::task::spawn_local(async move {
                     while let Some(event) = events.next().await {

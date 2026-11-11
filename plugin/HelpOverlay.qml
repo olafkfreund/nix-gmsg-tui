@@ -88,6 +88,7 @@ Item {
                 ]
 
                 RowLayout {
+                    id: helpRow
                     required property var modelData
                     Layout.fillWidth: true
                     spacing: root.theme.gap
@@ -104,7 +105,7 @@ Item {
                             id: keyLabel
                             anchors.centerIn: parent
                             textFormat: Text.PlainText
-                            text: parent.parent.modelData.keys
+                            text: helpRow.modelData.keys
                             color: Commons.Color.foreground
                             font.family: root.theme.family
                             font.pixelSize: root.theme.caption
@@ -116,7 +117,7 @@ Item {
                         Layout.fillWidth: true
                         textFormat: Text.PlainText
                         wrapMode: Text.WordWrap
-                        text: parent.modelData.desc
+                        text: helpRow.modelData.desc
                         color: Commons.Color.foreground
                         opacity: root.theme.dim
                         font.family: root.theme.family

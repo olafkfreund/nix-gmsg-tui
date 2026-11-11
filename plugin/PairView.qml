@@ -259,6 +259,7 @@ Item {
                 ]
 
                 Rectangle {
+                    id: pairButton
                     required property var modelData
                     implicitWidth: btnText.implicitWidth + root.theme.padX * 2
                     implicitHeight: root.theme.ctl
@@ -272,18 +273,18 @@ Item {
                         id: btnText
                         anchors.centerIn: parent
                         textFormat: Text.PlainText
-                        text: parent.modelData.label
-                        color: parent.modelData.method === "google" ? Commons.Color.background : Commons.Color.foreground
+                        text: pairButton.modelData.label
+                        color: pairButton.modelData.method === "google" ? Commons.Color.background : Commons.Color.foreground
                         font.family: root.theme.family
                         font.pixelSize: root.theme.body
-                        font.bold: parent.modelData.method === "google"
+                        font.bold: pairButton.modelData.method === "google"
                     }
 
                     MouseArea {
                         anchors.fill: parent
                         enabled: !root.busy
                         cursorShape: Qt.PointingHandCursor
-                        onClicked: root.startPairing(parent.modelData.method)
+                        onClicked: root.startPairing(pairButton.modelData.method)
                     }
                 }
             }

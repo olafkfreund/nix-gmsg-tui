@@ -108,7 +108,8 @@ Item {
             TextField {
                 id: inputField
                 Layout.fillWidth: true
-                enabled: root.conversationId !== "" && !root.sending
+                // Not off while sending: a disabled field drops focus. submit() guards resends.
+                enabled: root.conversationId !== ""
                 placeholderText: I18n.t("gmessages.composer_placeholder", "Write a message… (Ctrl+Enter to send)")
                 wrapMode: TextInput.Wrap
 
