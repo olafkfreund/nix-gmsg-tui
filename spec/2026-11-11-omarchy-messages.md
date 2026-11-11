@@ -1,5 +1,5 @@
 ---
-status: draft
+status: approved
 issue: none (issues are disabled on the fork)
 intent: intent/2026-11-11-omarchy-messages.md
 ---
