@@ -31,17 +31,18 @@ What exists to build on:
 On p620, from one Nix flake in this repository:
 1. An omarchy-shell plugin appears (service, bar widget, panel) and follows the theme,
    accent and window rounding live, like the first-party plugins.
-2. The bar shows the unread count; a new message raises a desktop notification.
+2. The bar shows the unread count, and new messages raise desktop notifications (rules
+   in 7).
 3. The panel pairs with the phone (Google sign-in window, emoji to tap, or QR), with no
    terminal involved.
 4. The panel does what the TUI does today: conversation list, history, send and reply,
    media (view and save), reactions, start a chat from contacts, archive, restore and
    delete, and unpair.
+   Destructive actions ask first, as the TUI does. Unpair keeps the message store;
+   only an explicit "remove all data" deletes it.
 5. After a restart (backend, shell or machine), the session and the encrypted store
    reopen without pairing again. Existing state paths and the keyring entry name
    (`gmessages-tui`) are kept, so data already on disk stays readable.
-   Destructive actions ask first, as the TUI does. Unpair keeps the message store;
-   only an explicit "remove all data" deletes it.
 6. If Google refuses the sign-in window, the panel offers the manual way (paste the
    cookies of a signed-in browser), as the TUI does today.
 7. The badge counts unread conversations. Notifications fire once per new incoming
