@@ -33,6 +33,9 @@ FloatingWindow {
 
     // Plain keys belong to a text field that has focus, not to navigation.
     readonly property bool editing: threadView.editing || convList.editing
+    // FloatingWindow is a Quickshell wrapper with no `active`; ask the native window.
+    readonly property var nativeWindow: root.contentItem ? root.contentItem.Window.window : null
+    readonly property bool windowActive: root.nativeWindow ? root.nativeWindow.active === true : false
     readonly property bool twoColumns: root.width >= 720
     readonly property bool ready: appClient.connected && !appClient.mismatch && appClient.state === "ready"
     readonly property bool threadVisible: root.ready && root.activeConversation !== "" && (root.twoColumns || root.activeConversation !== "")
@@ -48,7 +51,7 @@ FloatingWindow {
             root.lastReportedFocus = "__unset__";
             return;
         }
-        var focusedConv = (root.visible && root.active && root.ready && root.activeConversation !== "")
+        var focusedConv = (root.visible && root.windowActive && root.ready && root.activeConversation !== "")
             ? root.activeConversation
             : null;
         var key = focusedConv === null ? "__null__" : focusedConv;
@@ -58,7 +61,7 @@ FloatingWindow {
     }
 
     onVisibleChanged: root.syncFocus()
-    onActiveChanged: root.syncFocus()
+    onWindowActiveChanged: root.syncFocus()
     onActiveConversationChanged: root.syncFocus()
 
     Connections {
@@ -241,7 +244,7 @@ FloatingWindow {
                 client: appClient
                 theme: appTheme
                 compact: !root.twoColumns
-                focused: root.visible && root.active
+                focused: root.visible && root.windowActive
                 conversationId: root.activeConversation
                 conversationName: root.activeConversationName
 
