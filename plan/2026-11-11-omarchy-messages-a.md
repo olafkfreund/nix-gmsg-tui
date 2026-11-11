@@ -747,6 +747,18 @@ Second round, at the owner's request ("fix the findings"):
   pairing buttons are hidden while pairing; key details are shown.
 - `nix/package.nix`: `plugin/` is outside the Rust source.
 
+Found while installing on p620 (step 9), fixed in b536e70, 622a063 and ac7e102:
+
+- `FloatingWindow` has neither `active` nor `appId`, so `App.qml` failed to load and
+  the window never opened. Focus now comes from `contentItem.Window.window.active`, and
+  `appId` is gone. The parse-only lint missed both: the files suppress
+  `missing-property`. Linting against Quickshell 0.3.2's qmltypes with that line
+  removed finds them.
+- **Deviation from step 8:** `nix/plugin.nix` puts the QML under `v-<source hash>/`
+  and rewrites the manifest's entry points. Qt's QML disk cache keys on URL and mtime,
+  store files all have mtime 1970, and the shell kept the old compiled `App.qml` after
+  an update.
+
 Known limit, kept: `notify-send` takes the text as arguments, so it is in
 `/proc/<pid>/cmdline` while the notification is open (fine on a single-user host).
 
