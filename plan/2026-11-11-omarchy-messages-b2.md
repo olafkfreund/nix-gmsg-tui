@@ -1,5 +1,5 @@
 ---
-status: draft
+status: approved
 issue: none (issues are disabled on the fork)
 spec: spec/2026-11-11-omarchy-messages.md
 stage: b2 (media and reactions; the rest of stage b after b1's contact pictures)
