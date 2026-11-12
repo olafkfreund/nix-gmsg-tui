@@ -2,8 +2,6 @@
 
 **Google Messages (RCS and SMS) in your terminal.** Pair it with your Android phone, the way Google Messages for web does, and read and answer your texts without leaving the terminal.
 
-![gmessages-tui: chat list, a group chat, an emoji shortcode, search, a new chat](doc/demo.gif)
-
 - **Native, not a wrapped web page**: a Rust program speaking the Google Messages for web protocol itself, through [gmessages-proto](gmessages-proto/), a library written for it.
 - **Images in the terminal**: thumbnails inline (kitty graphics protocol), pasted with `Ctrl+V`, opened full size with `o`.
 - **The whole phone**: inbox, archive, spam and trash folders kept in sync both ways; new chats with contacts or numbers, groups; read state, typing, desktop notifications; messages not sent shown as on the phone, with resend.
@@ -14,32 +12,54 @@ Built on the protocol work of [mautrix-gmessages](https://github.com/mautrix/gme
 
 **Not affiliated with Google.** Google Messages is a trademark of Google LLC.
 
-## Install
+## Omarchy plugin (Nix)
 
-Packages for Linux x86-64 are attached to each [release](https://github.com/louisrubet/gmessages-tui/releases/latest):
+This fork turns gmessages-tui into **Messages**, an Omarchy shell plugin (`olafkfreund.gmessages`). It has a bar icon with an unread count, a window with your conversations and one thread, desktop notifications, and pairing from the window. It has two parts:
 
-| Distribution | Install |
+- `gmessages-tui serve`, a user service that owns the session and the encrypted store. It talks to the plugin over `$XDG_RUNTIME_DIR/gmessages-tui/daemon.sock`, a socket only your user can open.
+- `plugin/`: the Quickshell QML that the shell loads.
+
+The terminal interface isn't built in this fork; use [upstream gmessages-tui](https://github.com/louisrubet/gmessages-tui) for it.
+
+Flake outputs (x86_64-linux):
+
+| Output | What |
 |---|---|
-| Ubuntu 24.04 | `sudo apt install ./ubuntu-24.04-gmessages-tui-1.3.6-1.amd64.deb` |
-| Ubuntu 22.04 | `sudo apt install ./ubuntu-22.04-gmessages-tui-1.3.6-1.amd64.deb` |
-| Fedora 45 | `sudo dnf install ./fedora-45-gmessages-tui-1.3.6-1.x86_64.rpm` |
-| Fedora 44, 43 | `sudo dnf install ./fedora-44-gmessages-tui-1.3.6-1.x86_64.rpm` |
-| Arch Linux | `sudo pacman -U archlinux-latest-gmessages-tui-1.3.6-1-x86_64.pkg.tar.zst` |
+| `packages.gmessages-tui` (`default`) | the binary, with `serve` and the sign-in window |
+| `packages.plugin` | the plugin directory, with `notify-send` patched in |
+| `overlays.default` | `gmessages-tui` and `gmessages-plugin` |
+| `homeManagerModules.default` | `services.gmessages`: the package and the `gmessages-tui` user service |
+| `checks` | both packages, with the Rust tests and a QML parse check |
 
-Elsewhere, build it with Cargo (below). Packages are made with [multi-distro-packager](https://github.com/louisrubet/multi-distro-packager) from [packaging/](packaging/); [packaging/aur/](packaging/aur/) holds the PKGBUILD for the AUR.
+With home-manager on its own:
 
-## Quick start
-
-Needs Rust ≥ 1.89 and the OpenSSL development package (Fedora: `openssl-devel`, Debian/Ubuntu: `libssl-dev`). On Linux, the sign-in window also needs GTK 3 and WebKitGTK 4.1 (Fedora: `gtk3-devel webkit2gtk4.1-devel`, Debian/Ubuntu: `libgtk-3-dev libwebkit2gtk-4.1-dev`).
-
-```sh
-cargo install --locked gmessages-tui   # or a package, above
-gmessages-tui
+```nix
+{
+  imports = [ inputs.gmessages.homeManagerModules.default ];
+  services.gmessages.enable = true;
+}
 ```
 
-First run: sign in to the phone's Google account in the window that opens, then tap on your phone the emoji shown in the terminal. That's it: your conversations come in.
+On a Nixarchy host, as p620 does, add the plugin too:
 
-No display (over SSH, in a container)? The sign-in window is skipped: pairing goes on from your browser (see [options](#pairing-and-options)). Add `--no-default-features` to the install for a headless build without the window at all. The latest sources: `cargo install --locked --git https://github.com/louisrubet/gmessages-tui`; from a checkout: `cargo install --locked --path .`.
+```nix
+{ inputs, pkgs, ... }:
+{
+  home-manager.users.<you> = {
+    imports = [ inputs.gmessages.homeManagerModules.default ];
+    services.gmessages.enable = true;
+    programs.nixarchy.plugins."olafkfreund.gmessages".src =
+      inputs.gmessages.packages.${pkgs.system}.plugin;
+    local.omarchy.enableOnce = [ "olafkfreund.gmessages" ];
+  };
+}
+```
+
+State lives where it did: the session, the store and `phone.log` in `~/.local/share/gmessages-tui/`, the cache in `~/.cache/gmessages-tui/`, and the store key in the keyring under the service `gmessages-tui`. The service logs to the journal:
+
+```sh
+journalctl --user -u gmessages-tui
+```
 
 ## How it works
 
@@ -63,81 +83,6 @@ Google Messages has no public API. Like Google Messages for web, gmessages-tui n
 - **Where do my messages go?** From your phone to your terminal, through Google's relay, as with messages.google.com. Locally, they are kept in an encrypted store (see [Security details](#security-details)).
 - **What is out of scope?** Calls, stickers, and recording voice messages.
 
-## Pairing and options
-
-`gmessages-tui --unpair` unpairs: Google revokes this device, so your phone no longer lists it (*Device pairing*), and the session here is deleted; the messages stored stay, and the next start pairs again. (`--reset-login`, its name up to 1.3.1, does the same.)
-
-`gmessages-tui --manual` pairs from your browser: open the link printed in the terminal, sign in in a Firefox private window, then Developer tools › Network › `config` › *Copy as cURL*, and paste in the terminal or the page. It is also what happens when the sign-in window cannot open (no display), and the way out when Google refuses the window, or shows in it a captcha that cannot be read.
-
-`gmessages-tui --qr` pairs by QR code, for phones that still offer it: scan it with the scanner of Google Messages (*Device pairing* › *QR code scanner*), not with the camera, which only opens a Google help page. No scanner there? Use `--manual`.
-
-`gmessages-tui --version` prints the release version, `gmessages-tui --help` the options.
-
-## Uninstall
-
-```sh
-gmessages-tui --uninstall        # unpairs, then: store key in the keyring, ~/.local/share/gmessages-tui, ~/.cache/gmessages-tui
-cargo uninstall gmessages-tui    # the program (or with your package manager)
-```
-
-`--uninstall` asks for confirmation. If Google could not be told, it says so: then remove the device from your phone (*Device pairing*).
-
-## Terminal
-
-Any terminal works. For thumbnails, use one that speaks the [kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/) **with Unicode placeholders**:
-
-| Terminal | Linux | macOS | Windows |
-|---|:-:|:-:|:-:|
-| [Ghostty](https://ghostty.org) (recommended) | ✓ | ✓ | |
-| [kitty](https://sw.kovidgoyal.net/kitty/) | ✓ | ✓ | |
-| [Rio](https://rioterm.com) | ✓ | ✓ | ✓ |
-
-On Windows, Rio is the only native option; kitty also runs under WSL with WSLg.
-
-Elsewhere (WezTerm, Konsole, iTerm2, Warp, Windows Terminal, Alacritty, inside tmux…) everything works but graphics are reduced: images show as `[image #1]` and open full size with `o`.
-
-## Keys
-
-| Key | Action |
-|---|---|
-| `↑` `↓` | select chat / message (in a chat, `↑` starts selecting) |
-| `Enter` | open chat, new message, send |
-| `r` | reply to the selected message |
-| `e` | react to the selected message: `1`–`6` for the usual ones, or type a shortcode |
-| `f` | forward the selected message |
-| `c` | copy the selected message (OSC 52) |
-| `o` | open the links and images of the selected message |
-| `c` | on a message being sent ("Sending…"): cancel it (it may have left already) |
-| `s` | on a message not sent (⚠ Not sent, in red): send it again |
-| `Ctrl+V` | paste the image in the clipboard |
-| `/` | find chats by name and messages by text, ignoring case and accents (from the chat list); `Enter` goes to the results, where `Enter` opens the one selected, `Space`, `P`, `u`, `a`, `r`, `Del` act on the chats found and `/` types again; `Esc` goes back |
-| `n` | new chat (from the chat list): type a name or a number, `Enter` adds the contact selected or the number, `,` adds the number typed; several make a group; `Enter` again starts the chat |
-| `Space` | mark / unmark the selected chat (`Esc` unmarks all) |
-| `P` | pin / unpin the selected chat, or the marked ones |
-| `u` | mark the selected or marked chats read, on the phone too; already read, unread (here only: telling the phone is not supported) |
-| `Shift+↑` `Shift+↓` | move the selected pinned chat up / down among the pinned ones (or `Alt+↑` `Alt+↓`) |
-| `a` | archive the selected or marked chats (from the chat list) |
-| `Del` | delete the selected or marked chats: to the trash, for good from there (confirmed); in a chat, the selected message, for you (confirmed) |
-| `r` | move the selected or marked chats back to the inbox (from a folder) |
-| `X` | purge the trash: delete all its chats for good (from *Trash*, confirmed) |
-| `p` | parameters (from the chat list) |
-| `?` | all the keys in the footer, or only those that fit (not where `?` is typed) |
-| `Esc` | unselect, back (a message being sent goes on) |
-| `q` | quit |
-
-
-## Good to know
-
-- **History**: at start, the interface opens on the store once connected (or after 10 s, to read offline). Only conversations with new messages are fetched again, their last 30 messages.
-- **Folders**: *Archive*, *Spam & blocked* and *Trash* show under the chats when not empty; `Enter` opens one, `Esc` goes back.
-- **Phone sync**: conversations archived, trashed, in spam or blocked on the phone move to their folder, those deleted for good go (with their messages here); renames show at once; reading a chat here marks it read on the phone, and the other way round. `Del` sends a chat to the trash, as on the phone; only from *Trash* does it delete for good.
-- **Downloads**: images are fetched when they arrive or when a chat is opened; videos and files wait for `o`. Downloaded media are stored.
-- **Formatting**: RCS and SMS have none; `**bold**` and the like are sent as plain text.
-- **②** counts the messages received since you last opened a chat; opening it shows a "2 new messages" line above them.
-- **Device name**: the phone lists this client as *gmessages-tui*.
-- **State**: `~/.local/share/gmessages-tui/`. See [Security](#security).
-- **Interface**: [chat-tui-core](https://github.com/louisrubet/chat-tui-core), pinned by tag in `Cargo.toml`; its demo with fake chats is `cargo run --example mock_tui` there.
-
 ## Security details
 
 The state holds the session (`session.json`: it gives access to your messages through the phone), the store and the log (`phone.log`).
@@ -145,11 +90,10 @@ The state holds the session (`session.json`: it gives access to your messages th
 - **Encrypted at rest**: the store (`messages.db`: conversations, messages, media) uses SQLCipher.
 - **The key** is 32 random bytes generated on the first start, kept in the OS keyring: Secret Service on Linux (GNOME Keyring, KWallet), Keychain on macOS, Credential Manager on Windows, under the service `gmessages-tui`.
   To see it on Linux: `secret-tool search service gmessages-tui`.
-- **No keyring** (headless Linux, SSH): a passphrase is asked at startup instead, or taken from `GMESSAGES_TUI_PASSPHRASE`.
+- **No keyring** (headless Linux, SSH): set `GMESSAGES_TUI_PASSPHRASE` for the service; an empty one is refused. A locked keyring is retried every 30 s until it is unlocked; a key missing for an existing store is reported, never replaced by a new one.
 - **Files** are created readable by you only (Unix).
 - **Sign-in**: the window is private and saves no browser profile; once paired, the session is all that is kept.
-- **Unpair**: `gmessages-tui --unpair` has Google revoke this device, then deletes the session. If Google cannot be told (offline), remove the device from your phone (*Device pairing*): that also revokes it.
-- **Uninstall**: `gmessages-tui --uninstall` unpairs, deletes the keyring entry, then the store and the rest of the state.
+- **Unpair**: remove the device from your phone (*Device pairing*); the service then shows pairing again. Uninstalling: disable the service, then delete the keyring entry and the two state directories.
 - **Limits**: a program running in your session can read the unlocked keyring. Full disk encryption protects the rest of your machine.
 
 ## Upgrading from 1.2 and earlier
@@ -159,10 +103,10 @@ Earlier versions embedded gmd, a Go helper built on libgm. Its session is conver
 ## Dev
 
 ```sh
-cargo run                                     # the app
+cargo run -- serve                            # the service
 cargo test --workspace                        # the app and gmessages-proto
 cargo run --example wry_signin --features wry-signin   # does Google accept the webview?
-GMESSAGES_TUI_LOG=gmessages_proto=trace cargo run       # log everything to phone.log
+GMESSAGES_TUI_LOG=gmessages_proto=trace cargo run -- serve   # log everything to phone.log
 ```
 
 ## Credits

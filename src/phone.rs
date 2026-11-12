@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use futures::StreamExt;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use gmessages_proto as gm;
-pub use gmessages_proto::ReactionOp;
 use serde::{Deserialize, Serialize};
+use tokio::time::Instant as TokioInstant;
 
 /// What the phone reports.
 #[derive(Debug)]
@@ -52,6 +52,12 @@ pub enum Event {
         attachments: Vec<Attachment>,
         error: Option<String>,
     },
+    /// The pictures requested by `Avatars`, keyed by their prefixed ids.
+    Avatars {
+        id: u64,
+        images: Vec<(String, Vec<u8>)>,
+        error: Option<String>,
+    },
     /// A conversation looked up (`Lookup`) the phone no longer has.
     Gone {
         conversation: String,
@@ -74,12 +80,11 @@ pub enum Event {
         id: u64,
         error: Option<String>,
     },
-    /// The message sent by the `Send` command of the same `id`, as the phone echoed it.
+    /// The result of the `Send` command of the same `id`.
     Sent {
         id: u64,
         conversation: String,
-        message: Option<Message>,
-        error: Option<String>,
+        outcome: SendOutcome,
     },
     /// A message received, sent from the phone, or updated; `old` if not news.
     Message {
@@ -111,6 +116,18 @@ pub enum Event {
     Fatal {
         message: String,
     },
+    Unpaired {
+        reason: String,
+    },
+}
+
+#[derive(Debug)]
+pub enum SendOutcome {
+    Sent(Message),
+    Accepted(Message),
+    Unavailable(String),
+    Rejected(String),
+    Uncertain(String),
 }
 
 /// What the interface asks.
@@ -121,6 +138,8 @@ pub enum Command {
         cookies: BTreeMap<String, String>,
     },
     PairQr,
+    #[allow(dead_code, reason = "used by the daemon in step 6")]
+    CancelPairing,
     /// Fetches the last messages of these conversations: a `History` each.
     Fetch(Vec<String>),
     /// Asks about these conversations, missing from the lists: `Conversation` or `Gone`.
@@ -130,6 +149,11 @@ pub enum Command {
         id: u64,
         message: String,
         media: Vec<serde_json::Value>,
+    },
+    /// Fetches contact and participant pictures: `Avatars`.
+    Avatars {
+        id: u64,
+        ids: Vec<String>,
     },
     /// Sends to `conversation`: `Sent`.
     Send {
@@ -207,6 +231,10 @@ pub struct Conversation {
     /// Not read on the phone.
     #[serde(default)]
     pub unread: bool,
+    #[serde(default)]
+    pub colour: String,
+    #[serde(default)]
+    pub avatar_id: Option<String>,
 }
 
 /// A message of a conversation, as the store keeps it.
@@ -291,6 +319,8 @@ pub struct Attachment {
     pub data: Vec<u8>,
     pub width: Option<u32>,
     pub height: Option<u32>,
+    /// False when this is the preview or the inline thumbnail, not the medium itself.
+    pub full: bool,
 }
 
 /// One person's emoji on a message.
@@ -345,6 +375,7 @@ impl Phone {
             config: gm::Config::with_device_name(DEVICE_NAME),
             emit,
             inner: RefCell::default(),
+            pairing_cancel: RefCell::default(),
         });
         state.inner.borrow_mut().me.insert("1".to_string());
         tokio::task::spawn_local(start(state.clone()));
@@ -418,6 +449,7 @@ struct State {
     config: gm::Config,
     emit: UnboundedSender<Event>,
     inner: RefCell<Inner>,
+    pairing_cancel: RefCell<Option<gm::CancelToken>>,
 }
 
 #[derive(Default)]
@@ -640,6 +672,33 @@ fn conversation(c: &gm::Conversation) -> Conversation {
         folder: folder.map(str::to_string),
         deleted: c.is_deleted(),
         unread: c.unread,
+        colour: colour(c),
+        avatar_id: avatar_id(c),
+    }
+}
+
+fn colour(c: &gm::Conversation) -> String {
+    fn valid(value: &str) -> Option<String> {
+        let hex = value.strip_prefix('#').unwrap_or(value);
+        (hex.len() == 6 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then(|| format!("#{}", hex.to_ascii_lowercase()))
+    }
+    valid(&c.colour)
+        .or_else(|| c.other_participant().and_then(|p| valid(&p.colour)))
+        .unwrap_or_default()
+}
+
+fn avatar_id(c: &gm::Conversation) -> Option<String> {
+    if c.is_group {
+        return None;
+    }
+    let p = c.other_participant()?;
+    if !p.contact_id.is_empty() {
+        Some(format!("c:{}", p.contact_id))
+    } else if !p.id.is_empty() {
+        Some(format!("p:{}", p.id))
+    } else {
+        None
     }
 }
 
@@ -832,10 +891,14 @@ async fn follow(state: Rc<State>, mut events: gm::EventReceiver) {
                     reason => {
                         let _ = std::fs::remove_file(&state.session_path);
                         state.inner.borrow_mut().client = None;
-                        state.emit(Event::Fatal {
-                            message: format!(
-                                "unpaired from the phone ({reason:?}): run again to pair"
-                            ),
+                        state.emit(Event::Unpaired {
+                            reason: match reason {
+                                gm::LogoutReason::Unpaired => "unpaired",
+                                gm::LogoutReason::AccountLoggedOut => "account_logged_out",
+                                gm::LogoutReason::CredentialsRejected(_) => "credentials_rejected",
+                                _ => "unknown",
+                            }
+                            .to_string(),
                         });
                     }
                 }
@@ -975,6 +1038,59 @@ async fn list_folder(
     (listed, false, None)
 }
 
+async fn avatars(state: &State, id: u64, ids: Vec<String>) -> Event {
+    let start = TokioInstant::now();
+    let deadline = start + Duration::from_secs(30);
+    let mut images = Vec::new();
+    let mut errors = Vec::new();
+    let contacts: Vec<String> = ids
+        .iter()
+        .filter_map(|s| s.strip_prefix("c:"))
+        .map(str::to_string)
+        .collect();
+    let participants: Vec<String> = ids
+        .iter()
+        .filter_map(|s| s.strip_prefix("p:"))
+        .map(str::to_string)
+        .collect();
+
+    match state.client() {
+        Ok(client) => {
+            if !contacts.is_empty() {
+                match tokio::time::timeout_at(deadline, client.contact_thumbnails(&contacts)).await
+                {
+                    Ok(Ok(found)) => {
+                        images.extend(found.into_iter().map(|t| (format!("c:{}", t.id), t.image)))
+                    }
+                    Ok(Err(e)) => errors.push(format!("contact thumbnails: {e}")),
+                    Err(e) => errors.push(format!("contact thumbnails: {e}")),
+                }
+            }
+            if !participants.is_empty() {
+                match tokio::time::timeout_at(
+                    deadline,
+                    client.participant_thumbnails(&participants),
+                )
+                .await
+                {
+                    Ok(Ok(found)) => {
+                        images.extend(found.into_iter().map(|t| (format!("p:{}", t.id), t.image)))
+                    }
+                    Ok(Err(e)) => errors.push(format!("participant thumbnails: {e}")),
+                    Err(e) => errors.push(format!("participant thumbnails: {e}")),
+                }
+            }
+        }
+        Err(e) => errors.push(e),
+    }
+    tokio::time::sleep_until(start + Duration::from_secs(2)).await;
+    Event::Avatars {
+        id,
+        images,
+        error: (!errors.is_empty()).then(|| errors.join("; ")),
+    }
+}
+
 /// Handles the commands of the interface until it stops.
 async fn run_commands(state: Rc<State>, mut commands: UnboundedReceiver<Command>) {
     while let Some(command) = commands.next().await {
@@ -982,6 +1098,12 @@ async fn run_commands(state: Rc<State>, mut commands: UnboundedReceiver<Command>
         match command {
             Command::PairGoogle { cookies } => pair(state, Some(cookies)),
             Command::PairQr => pair(state, None),
+            Command::CancelPairing => {
+                if let Some(cancel) = state.pairing_cancel.borrow_mut().take() {
+                    cancel.cancel();
+                }
+                state.inner.borrow_mut().pairing = false;
+            }
             Command::Fetch(ids) => {
                 tokio::task::spawn_local(fetch(state, ids));
             }
@@ -1005,6 +1127,11 @@ async fn run_commands(state: Rc<State>, mut commands: UnboundedReceiver<Command>
                     state.emit(event);
                 });
             }
+            Command::Avatars { id, ids } => {
+                tokio::task::spawn_local(async move {
+                    state.emit(avatars(&state, id, ids).await);
+                });
+            }
             Command::Send {
                 id,
                 conversation,
@@ -1013,16 +1140,11 @@ async fn run_commands(state: Rc<State>, mut commands: UnboundedReceiver<Command>
                 attachments,
             } => {
                 tokio::task::spawn_local(async move {
-                    let sent = send(&state, &conversation, text, reply, attachments).await;
-                    let (message, error) = match sent {
-                        Ok(message) => (Some(message), None),
-                        Err(error) => (None, Some(error)),
-                    };
+                    let outcome = send(&state, &conversation, text, reply, attachments).await;
                     state.emit(Event::Sent {
                         id,
                         conversation,
-                        message,
-                        error,
+                        outcome,
                     });
                 });
             }
@@ -1263,28 +1385,38 @@ async fn fetch(state: Rc<State>, ids: Vec<String>) {
     futures::future::join_all(workers).await;
 }
 
-/// Sends `text` and `attachments` to `conversation`, from the SIM it uses, and returns the
-/// message as the phone echoes it (with its id).
+/// Sends `text` and `attachments` to `conversation`, from the SIM it uses.
 async fn send(
     state: &State,
     conversation: &str,
     text: String,
     reply: Option<String>,
     attachments: Vec<Attachment>,
-) -> Result<Message, String> {
-    let client = state.client()?;
-    let c = state.conversation(conversation).await?;
+) -> SendOutcome {
+    let client = match state.client() {
+        Ok(client) => client,
+        Err(error) => return SendOutcome::Unavailable(error),
+    };
+    let c = match state.conversation(conversation).await {
+        Ok(conversation) => conversation,
+        Err(error) => return SendOutcome::Unavailable(error),
+    };
     let mut outgoing = gm::OutgoingMessage::new(&c, text.clone());
     for a in &attachments {
         let name = a.name.clone().unwrap_or_default();
-        let media = client
-            .upload_media(&a.data, &name, &a.content_type)
-            .await
-            .map_err(|e| format!("cannot upload {}: {e}", a.content_type))?;
+        let media = match client.upload_media(&a.data, &name, &a.content_type).await {
+            Ok(media) => media,
+            Err(error) => {
+                return SendOutcome::Unavailable(format!(
+                    "cannot upload {}: {error}",
+                    a.content_type
+                ));
+            }
+        };
         outgoing = outgoing.with_media(media);
     }
     if outgoing.text.is_empty() && outgoing.media.is_empty() {
-        return Err("nothing to send".to_string());
+        return SendOutcome::Unavailable("nothing to send".to_string());
     }
     if let Some(reply) = &reply {
         outgoing = outgoing.reply_to(reply.clone());
@@ -1310,12 +1442,12 @@ async fn send(
     }
     let _forget = Forget(state, tmp.clone());
 
-    let outcome = client
-        .send_message(outgoing)
-        .await
-        .map_err(|e| e.to_string())?;
+    let outcome = match client.send_message(outgoing).await {
+        Ok(outcome) => outcome,
+        Err(error) => return SendOutcome::Uncertain(error.to_string()),
+    };
     if outcome.result != gm::SendResult::Accepted {
-        return Err(format!("not sent ({:?})", outcome.result));
+        return SendOutcome::Rejected(format!("not sent ({:?})", outcome.result));
     }
     let echoed = tokio::time::timeout(ECHO_WAIT, async {
         while let Some(m) = echoes.next().await {
@@ -1327,11 +1459,11 @@ async fn send(
     })
     .await;
     if let Ok(Some(message)) = echoed {
-        return Ok(message);
+        return SendOutcome::Sent(message);
     }
     log::warn("no echo of the message sent");
     // Sent, but its id is not known: the temporary one, until the conversation is fetched.
-    Ok(Message {
+    SendOutcome::Accepted(Message {
         id: tmp,
         timestamp_ms: gm::Timestamp::now().as_millis(),
         from_me: true,
@@ -1344,6 +1476,17 @@ async fn send(
         deleted: false,
         failed: false,
     })
+}
+
+/// The largest medium downloaded, declared or real.
+const MEDIA_MAX: usize = 100 * 1024 * 1024;
+
+/// Fails "too large" if the declared or the real size is over `MEDIA_MAX`.
+fn check_size(declared: i64, actual: usize) -> Result<(), String> {
+    if actual > MEDIA_MAX || usize::try_from(declared).is_ok_and(|d| d > MEDIA_MAX) {
+        return Err("too large".to_string());
+    }
+    Ok(())
 }
 
 /// Downloads `media`, of `message`; those the phone has sent only as previews are asked in
@@ -1361,13 +1504,16 @@ async fn download(
     for medium in media {
         let medium: Medium =
             serde_json::from_value(medium).map_err(|e| format!("bad medium stored: {e}"))?;
+        check_size(medium.size, 0)?;
         let medium = full(state, &client, message, medium).await;
         // The best there is: the medium, its preview, the small preview in the message.
+        check_size(medium.size, 0)?;
         let (id, key) = if medium.media_id.is_empty() {
             (&medium.thumb_id, &medium.thumb_key)
         } else {
             (&medium.media_id, &medium.key)
         };
+        let full = !medium.media_id.is_empty();
         let data = if !id.is_empty() {
             client
                 .download_media(id, key)
@@ -1378,12 +1524,14 @@ async fn download(
         } else {
             return Err("not downloaded by the phone yet".to_string());
         };
+        check_size(0, data.len())?;
         attachments.push(Attachment {
             content_type: medium.mime,
             name: Some(medium.name).filter(|n| !n.is_empty()),
             data,
             width: u32::try_from(medium.width).ok().filter(|&w| w > 0),
             height: u32::try_from(medium.height).ok().filter(|&h| h > 0),
+            full,
         });
     }
     Ok(attachments)
@@ -1465,39 +1613,52 @@ fn pair(state: Rc<State>, cookies: Option<BTreeMap<String, String>>) {
     if std::mem::replace(&mut state.inner.borrow_mut().pairing, true) {
         return state.status("already pairing");
     }
+    let cancel = gm::CancelToken::new();
+    state.pairing_cancel.replace(Some(cancel.clone()));
     tokio::task::spawn_local(async move {
-        let previous = state
-            .inner
-            .borrow()
-            .session
-            .clone()
-            .filter(gm::Session::is_google_account);
-        let paired = match (cookies, previous) {
-            (Some(cookies), Some(mut session)) => {
-                session.cookies = cookies.clone();
-                match gm::Client::connect(state.config.clone(), session.clone()).await {
-                    Ok((client, _)) => {
-                        client.disconnect();
-                        Ok(session)
+        let paired = tokio::select! {
+            _ = cancel.cancelled() => Err("cancelled".to_string()),
+            result = async {
+                let previous = state
+                    .inner
+                    .borrow()
+                    .session
+                    .clone()
+                    .filter(gm::Session::is_google_account);
+                match (cookies, previous) {
+                    (Some(cookies), Some(mut session)) => {
+                        session.cookies = cookies.clone();
+                        match gm::Client::connect(state.config.clone(), session.clone()).await {
+                            Ok((client, _)) => {
+                                client.disconnect();
+                                Ok(session)
+                            }
+                            Err(e) => {
+                                log::warn(&format!("cannot sign the pairing in again: {e}"));
+                                pair_google(&state, cookies, &cancel).await
+                            }
+                        }
                     }
-                    Err(e) => {
-                        log::warn(&format!("cannot sign the pairing in again: {e}"));
-                        pair_google(&state, cookies).await
+                    (Some(cookies), None) => pair_google(&state, cookies, &cancel).await,
+                    (None, _) => {
+                        let emit = state.emit.clone();
+                        gm::pair_with_qr(state.config.clone(), &cancel, move |url| {
+                            let _ = emit.unbounded_send(Event::Qr {
+                                url: url.to_string(),
+                            });
+                        })
+                        .await
+                        .map_err(|e| format!("cannot pair: {e}"))
                     }
                 }
-            }
-            (Some(cookies), None) => pair_google(&state, cookies).await,
-            (None, _) => {
-                let emit = state.emit.clone();
-                gm::pair_with_qr(state.config.clone(), &gm::CancelToken::new(), move |url| {
-                    let _ = emit.unbounded_send(Event::Qr {
-                        url: url.to_string(),
-                    });
-                })
-                .await
-                .map_err(|e| format!("cannot pair: {e}"))
-            }
+            } => result,
         };
+        if cancel.is_cancelled() {
+            return state.emit(Event::PairFailed {
+                message: "cancelled".to_string(),
+            });
+        }
+        state.pairing_cancel.borrow_mut().take();
         state.inner.borrow_mut().pairing = false;
         match paired {
             Ok(session) => {
@@ -1513,13 +1674,14 @@ fn pair(state: Rc<State>, cookies: Option<BTreeMap<String, String>>) {
 async fn pair_google(
     state: &State,
     cookies: BTreeMap<String, String>,
+    cancel: &gm::CancelToken,
 ) -> Result<gm::Session, String> {
     let emit = state.emit.clone();
     let paired = gm::pair_with_google_account(
         state.config.clone(),
         cookies,
         gm::AccountPairingOptions::default(),
-        &gm::CancelToken::new(),
+        cancel,
         move |prompt| {
             let _ = emit.unbounded_send(Event::Emoji {
                 emoji: prompt.emoji.to_string(),
@@ -1717,7 +1879,7 @@ pub mod log {
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
         let Ok(file) = options.open(path) else { return };
         let filter = tracing_subscriber::EnvFilter::try_from_env("GMESSAGES_TUI_LOG")
-            .unwrap_or_else(|_| "gmessages_proto=debug,gmessages_tui=debug".into());
+            .unwrap_or_else(|_| "gmessages_proto=info,gmessages_tui=info".into());
         let _ = tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_ansi(false)
@@ -1736,6 +1898,98 @@ mod tests {
     use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 
     use super::*;
+
+    #[test]
+    fn check_size_caps_declared_and_real() {
+        assert!(check_size(10, 10).is_ok());
+        assert!(check_size(0, MEDIA_MAX).is_ok());
+        assert!(check_size(MEDIA_MAX as i64 + 1, 0).is_err());
+        assert_eq!(check_size(0, MEDIA_MAX + 1).unwrap_err(), "too large");
+        assert!(check_size(-1, 0).is_ok());
+    }
+
+    fn one_to_one() -> gm::Conversation {
+        gm::Conversation {
+            participants: vec![gm::Participant {
+                id: "person".into(),
+                contact_id: "contact".into(),
+                colour: "#AABBCC".into(),
+                visible: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn conversation_colour_uses_valid_hex_and_participant_fallback() {
+        let mut c = one_to_one();
+        for (input, expected) in [
+            ("1A73E8", "#1a73e8"),
+            ("#1a73e8", "#1a73e8"),
+            ("", "#aabbcc"),
+            ("blue", "#aabbcc"),
+            ("#12345", "#aabbcc"),
+        ] {
+            c.colour = input.into();
+            assert_eq!(colour(&c), expected);
+        }
+        c.participants[0].colour = "blue".into();
+        assert_eq!(colour(&c), "");
+    }
+
+    #[test]
+    fn avatar_id_uses_visible_other_person_and_contact_first() {
+        let mut c = one_to_one();
+        assert_eq!(avatar_id(&c).as_deref(), Some("c:contact"));
+        c.participants[0].contact_id.clear();
+        assert_eq!(avatar_id(&c).as_deref(), Some("p:person"));
+        c.participants[0].id.clear();
+        assert_eq!(avatar_id(&c), None);
+        c.participants[0].id = "person".into();
+        c.participants[0].is_me = true;
+        assert_eq!(avatar_id(&c), None);
+        c.participants[0].is_me = false;
+        c.participants[0].visible = false;
+        assert_eq!(avatar_id(&c), None);
+        c.participants.clear();
+        assert_eq!(avatar_id(&c), None);
+        c = one_to_one();
+        c.is_group = true;
+        assert_eq!(avatar_id(&c), None);
+    }
+
+    fn disconnected_state() -> Rc<State> {
+        let (emit, _) = unbounded();
+        Rc::new(State {
+            session_path: PathBuf::from("/unused"),
+            config: gm::Config::with_device_name(DEVICE_NAME),
+            emit,
+            inner: RefCell::default(),
+            pairing_cancel: RefCell::default(),
+        })
+    }
+
+    #[tokio::test]
+    async fn send_is_unavailable_before_a_phone_call() {
+        let state = disconnected_state();
+        let outcome = send(&state, "missing", "hello".into(), None, Vec::new()).await;
+        assert!(matches!(outcome, SendOutcome::Unavailable(_)));
+    }
+
+    #[tokio::test]
+    async fn cancel_pairing_cancels_the_active_token() {
+        let state = disconnected_state();
+        let token = gm::CancelToken::new();
+        state.pairing_cancel.replace(Some(token.clone()));
+        state.inner.borrow_mut().pairing = true;
+        let (commands, received) = unbounded();
+        commands.unbounded_send(Command::CancelPairing).unwrap();
+        drop(commands);
+        run_commands(state.clone(), received).await;
+        assert!(token.is_cancelled());
+        assert!(!state.inner.borrow().pairing);
+    }
 
     fn random(n: usize) -> Vec<u8> {
         let mut bytes = vec![0; n];

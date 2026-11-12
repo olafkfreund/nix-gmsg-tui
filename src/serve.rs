@@ -1,0 +1,988 @@
+//! One local daemon owns the encrypted store and fans phone events out to socket clients.
+
+use std::cell::Cell;
+use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use std::rc::Rc;
+use std::time::Duration;
+
+use futures::StreamExt;
+use serde::de::DeserializeOwned;
+use serde_json::{Value, json, to_value};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tokio::time::{Instant, timeout};
+
+use crate::{VERSION, key, pair, paths, phone, proto, store, sync};
+
+const MAX_LINE: usize = 1024 * 1024;
+const QUEUE: usize = 1000;
+/// Bytes waiting for one client; a client that falls further behind is dropped.
+const MAX_QUEUED: usize = 8 * 1024 * 1024;
+/// Same-user clients served at once: the shell's service, bar widget and window, with room.
+const MAX_CLIENTS: usize = 32;
+/// Exit status when another daemon holds the lock; the unit does not restart on it.
+pub const ALREADY_RUNNING: u8 = 3;
+
+// One event at a time through a channel: boxing buys nothing.
+#[allow(clippy::large_enum_variant)]
+enum Incoming {
+    Line(u64, String),
+    Closed(u64),
+    Phone(phone::Event),
+    Pasted(pair::Pasted),
+    PairDone,
+    Key(Result<Result<String, key::KeyError>, tokio::task::JoinError>),
+}
+
+enum PairStatus {
+    Asking,
+    Emoji(String),
+    Failed(String),
+    Paired,
+}
+
+struct Client {
+    tx: mpsc::Sender<String>,
+    queued: Rc<Cell<usize>>,
+    reader: JoinHandle<()>,
+    writer: JoinHandle<()>,
+    handshaken: bool,
+    mismatch: bool,
+}
+
+struct Pending {
+    conn: u64,
+    id: u64,
+    until: Instant,
+}
+
+struct Daemon {
+    clients: HashMap<u64, Client>,
+    pending: HashMap<u64, Pending>,
+    next_conn: u64,
+    next_rid: u64,
+    state: proto::State,
+    detail: Option<String>,
+    sync: Option<sync::Sync>,
+    commands: Option<phone::Commands>,
+    control: Option<phone::Control>,
+    pairing: Option<JoinHandle<()>>,
+    pair_status: Option<mpsc::Sender<PairStatus>>,
+    key_busy: bool,
+    data: PathBuf,
+    avatar_dir: PathBuf,
+    media_dir: PathBuf,
+    downloads: Option<PathBuf>,
+    tx: mpsc::Sender<Incoming>,
+}
+
+pub fn run() -> ExitCode {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("cannot start runtime: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let result = tokio::task::LocalSet::new().block_on(&runtime, serve());
+    if let Err(error) = result {
+        eprintln!("{error}");
+        if error.kind() == io::ErrorKind::AlreadyExists {
+            ExitCode::from(ALREADY_RUNNING)
+        } else {
+            ExitCode::FAILURE
+        }
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+async fn serve() -> io::Result<()> {
+    let data = paths::data()?;
+    let cache = paths::cache()?;
+    let runtime = paths::runtime()?;
+    for dir in [&data, &cache, &runtime] {
+        paths::create_private_dir(dir)?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let _lock = lock(&data.join("lock"))?;
+    let media = runtime.join("media");
+    clear_media(&media)?;
+    let avatars = runtime.join("avatars");
+    clear_media(&avatars)?;
+    let socket = runtime.join("daemon.sock");
+    if socket.exists() {
+        std::fs::remove_file(&socket)?;
+    }
+    let listener = UnixListener::bind(&socket)?;
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
+    let result = serve_bound(listener, data, &media, avatars.clone()).await;
+    let _ = std::fs::remove_file(&socket);
+    let _ = clear_media(&media);
+    let _ = clear_media(&avatars);
+    result
+}
+
+async fn serve_bound(
+    listener: UnixListener,
+    data: PathBuf,
+    media: &Path,
+    avatar_dir: PathBuf,
+) -> io::Result<()> {
+    trim_log(&data.join("phone.log"))?;
+    phone::log::init(&data.join("phone.log"));
+    let (tx, mut rx) = mpsc::channel(QUEUE);
+    let mut daemon = Daemon {
+        clients: HashMap::new(),
+        pending: HashMap::new(),
+        next_conn: 1,
+        next_rid: 1,
+        state: proto::State::Starting,
+        detail: None,
+        sync: None,
+        commands: None,
+        control: None,
+        pairing: None,
+        pair_status: None,
+        key_busy: false,
+        data,
+        avatar_dir,
+        media_dir: media.to_path_buf(),
+        downloads: dirs::download_dir(),
+        tx,
+    };
+    daemon.start_key();
+    let mut retry = tokio::time::interval_at(
+        Instant::now() + Duration::from_secs(30),
+        Duration::from_secs(30),
+    );
+    let mut deadlines = tokio::time::interval(Duration::from_millis(100));
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) => {
+                    if daemon.clients.len() < MAX_CLIENTS
+                        && stream.peer_cred().is_ok_and(|c| c.uid() == unsafe { libc::geteuid() })
+                    {
+                        daemon.accept(stream);
+                    }
+                }
+                // Out of fds or a client that reset: keep serving the others.
+                Err(error) => {
+                    eprintln!("accept: {error}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            },
+            incoming = rx.recv() => {
+                if let Some(incoming) = incoming { daemon.receive(incoming).await; }
+            }
+            _ = retry.tick() => {
+                if matches!(daemon.state, proto::State::Locked | proto::State::KeyringMissing) { daemon.start_key(); }
+            }
+            _ = deadlines.tick() => daemon.expire(),
+            _ = term.recv() => break,
+            _ = interrupt.recv() => break,
+        }
+    }
+    if let Some(pairing) = daemon.pairing.take() {
+        pairing.abort();
+    }
+    daemon.pair_status = None;
+    daemon.clients.clear();
+    if let Some(control) = daemon.control.take() {
+        let _ = timeout(Duration::from_secs(4), control.stop()).await;
+    }
+    Ok(())
+}
+
+impl Daemon {
+    fn state_data(&self) -> proto::StateData {
+        proto::StateData {
+            state: self.state,
+            detail: self.detail.clone(),
+            unread: self.sync.as_ref().map_or(0, sync::Sync::unread),
+        }
+    }
+
+    fn set_state(&mut self, state: proto::State, detail: Option<String>) {
+        self.state = state;
+        self.detail = detail.clone();
+        self.broadcast(proto::EventLine::new(
+            "state",
+            &proto::StateEvent { state, detail },
+        ));
+    }
+
+    /// Looks the store key up off the loop: Secret Service may show an unlock prompt and wait
+    /// on it without a time limit. One lookup at a time, so retries never stack prompts.
+    fn start_key(&mut self) {
+        if self.key_busy {
+            return;
+        }
+        self.key_busy = true;
+        let db = self.data.join("messages.db");
+        let tx = self.tx.clone();
+        tokio::task::spawn_local(async move {
+            let key = tokio::task::spawn_blocking(move || key::store_key(&db)).await;
+            let _ = tx.send(Incoming::Key(key)).await;
+        });
+    }
+
+    fn got_key(&mut self, key: Result<Result<String, key::KeyError>, tokio::task::JoinError>) {
+        self.key_busy = false;
+        if self.sync.is_some() {
+            return;
+        }
+        let key = match key {
+            Ok(Ok(key)) => key,
+            Ok(Err(error)) => {
+                let state = match error {
+                    key::KeyError::Missing(_) | key::KeyError::Refused(_) => {
+                        proto::State::KeyringMissing
+                    }
+                    _ => proto::State::Locked,
+                };
+                // A code the plugin can translate; the reason goes to the journal.
+                eprintln!("store key: {error}");
+                let detail = match error {
+                    key::KeyError::Empty => "empty_passphrase",
+                    key::KeyError::Locked(_) => "keyring_locked",
+                    key::KeyError::Missing(_) => "keyring_missing",
+                    key::KeyError::Refused(_) => "keyring_refused",
+                };
+                self.set_state(state, Some(detail.to_owned()));
+                return;
+            }
+            Err(error) => {
+                eprintln!("store key: {error}");
+                self.set_state(proto::State::KeyringMissing, Some("keyring_missing".into()));
+                return;
+            }
+        };
+        match store::Store::open(&self.data.join("messages.db"), &key) {
+            Ok(store) => {
+                let session = self.data.join("session.json");
+                // Paired before: connecting, so the plugin does not flash "sign in".
+                let state = if session.exists() {
+                    proto::State::Connecting
+                } else {
+                    proto::State::Login
+                };
+                let phone = phone::Phone::start(&session);
+                let (mut events, commands, control) = phone.split();
+                self.sync = Some(sync::Sync::new(
+                    Rc::new(store),
+                    commands.clone(),
+                    self.avatar_dir.clone(),
+                    self.media_dir.clone(),
+                    self.downloads.clone(),
+                ));
+                self.commands = Some(commands);
+                self.control = Some(control);
+                self.set_state(state, None);
+                let tx = self.tx.clone();
+                tokio::task::spawn_local(async move {
+                    while let Some(event) = events.next().await {
+                        if tx.send(Incoming::Phone(event)).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+            Err(error) => {
+                eprintln!("store: {error}");
+                self.set_state(proto::State::StoreUnreadable, None);
+            }
+        }
+    }
+
+    fn accept(&mut self, stream: UnixStream) {
+        let conn = self.next_conn;
+        self.next_conn += 1;
+        let (mut read, mut write) = stream.into_split();
+        let (tx, mut rx) = mpsc::channel::<String>(QUEUE);
+        let queued = Rc::new(Cell::new(0usize));
+        let drained = queued.clone();
+        let hello = proto::EventLine::new(
+            "hello",
+            &proto::HelloEvent {
+                protocol: proto::PROTOCOL,
+                version: VERSION.to_owned(),
+                state: self.state,
+                detail: self.detail.clone(),
+                unread: self.state_data().unread,
+            },
+        );
+        let _ = tx.try_send(serde_json::to_string(&hello).expect("hello serializes"));
+        let writer = tokio::task::spawn_local(async move {
+            while let Some(line) = rx.recv().await {
+                drained.set(drained.get().saturating_sub(line.len()));
+                if write.write_all(line.as_bytes()).await.is_err()
+                    || write.write_all(b"\n").await.is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let events = self.tx.clone();
+        let reader = tokio::task::spawn_local(async move {
+            let mut chunk = [0u8; 8192];
+            let mut line = Vec::new();
+            'read: loop {
+                let count = match read.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                for byte in &chunk[..count] {
+                    if *byte == b'\n' {
+                        let value =
+                            String::from_utf8(std::mem::take(&mut line)).unwrap_or_default();
+                        if events.send(Incoming::Line(conn, value)).await.is_err() {
+                            break 'read;
+                        }
+                    } else {
+                        line.push(*byte);
+                        if line.len() > MAX_LINE {
+                            break 'read;
+                        }
+                    }
+                }
+            }
+            let _ = events.send(Incoming::Closed(conn)).await;
+        });
+        self.clients.insert(
+            conn,
+            Client {
+                tx,
+                queued,
+                reader,
+                writer,
+                handshaken: false,
+                mismatch: false,
+            },
+        );
+    }
+
+    fn close(&mut self, conn: u64) {
+        if let Some(client) = self.clients.remove(&conn) {
+            client.reader.abort();
+            client.writer.abort();
+        }
+        let dropped: Vec<_> = self
+            .pending
+            .iter()
+            .filter(|(_, p)| p.conn == conn)
+            .map(|(&rid, _)| rid)
+            .collect();
+        for rid in dropped {
+            self.pending.remove(&rid);
+            if let Some(sync) = &mut self.sync {
+                sync.forget(rid);
+            }
+        }
+        if let Some(sync) = &mut self.sync {
+            sync.drop_conn(conn);
+        }
+    }
+
+    fn write<T: serde::Serialize>(&mut self, conn: u64, value: &T) {
+        let Ok(line) = serde_json::to_string(value) else {
+            self.close(conn);
+            return;
+        };
+        let len = line.len();
+        if len > MAX_LINE
+            || self
+                .clients
+                .get(&conn)
+                .is_some_and(|c| c.queued.get() + len > MAX_QUEUED || c.tx.try_send(line).is_err())
+        {
+            self.close(conn);
+        } else if let Some(c) = self.clients.get(&conn) {
+            c.queued.set(c.queued.get() + len);
+        }
+    }
+
+    fn broadcast(&mut self, event: proto::EventLine) {
+        let clients: Vec<_> = self
+            .clients
+            .iter()
+            .filter(|(_, c)| c.handshaken)
+            .map(|(&id, _)| id)
+            .collect();
+        for conn in clients {
+            self.write(conn, &event);
+        }
+    }
+
+    fn outputs(&mut self, outputs: Vec<proto::Out>) {
+        for output in outputs {
+            match output {
+                proto::Out::Broadcast(event) => {
+                    if event.event == "state"
+                        && let Ok(data) =
+                            serde_json::from_value::<proto::StateEvent>(event.data.clone())
+                    {
+                        self.state = data.state;
+                        self.detail = data.detail;
+                    }
+                    self.broadcast(event);
+                }
+                proto::Out::Reply { rid, result } => {
+                    if let Some(pending) = self.pending.remove(&rid) {
+                        self.write(
+                            pending.conn,
+                            &match result {
+                                Ok(data) => proto::Reply::ok(Some(pending.id), data),
+                                Err(error) => {
+                                    proto::Reply::err(Some(pending.id), error.code, error.message)
+                                }
+                            },
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn expire(&mut self) {
+        let expired: Vec<_> = self
+            .pending
+            .iter()
+            .filter(|(_, p)| p.until <= Instant::now())
+            .map(|(&rid, _)| rid)
+            .collect();
+        for rid in expired {
+            if let Some(pending) = self.pending.remove(&rid) {
+                if let Some(sync) = &mut self.sync {
+                    sync.forget(rid);
+                }
+                self.write(
+                    pending.conn,
+                    &proto::Reply::err(
+                        Some(pending.id),
+                        proto::ErrorCode::Timeout,
+                        "request timed out",
+                    ),
+                );
+            }
+        }
+    }
+
+    async fn receive(&mut self, incoming: Incoming) {
+        match incoming {
+            Incoming::Closed(conn) => self.close(conn),
+            Incoming::Key(key) => self.got_key(key),
+            Incoming::PairDone => {
+                self.pairing = None;
+                self.pair_status = None;
+            }
+            Incoming::Phone(event) => {
+                self.expire();
+                if let Some(status) = &self.pair_status {
+                    let status_event = match &event {
+                        phone::Event::Emoji { emoji } => Some(PairStatus::Emoji(emoji.clone())),
+                        phone::Event::PairFailed { message } => {
+                            Some(PairStatus::Failed(message.clone()))
+                        }
+                        phone::Event::Paired => Some(PairStatus::Paired),
+                        _ => None,
+                    };
+                    if let Some(status_event) = status_event {
+                        let _ = status.try_send(status_event);
+                    }
+                }
+                if let Some(sync) = &mut self.sync {
+                    let outputs = sync.handle(event);
+                    self.outputs(outputs);
+                }
+            }
+            Incoming::Pasted(pasted) => match pasted {
+                pair::Pasted::Cookies(cookies) => {
+                    if let Some(status) = &self.pair_status {
+                        let _ = status.try_send(PairStatus::Asking);
+                    }
+                    if let Some(commands) = &self.commands {
+                        commands.send(phone::Command::PairGoogle { cookies });
+                    }
+                }
+                pair::Pasted::Unavailable(message) => {
+                    self.pairing = None;
+                    self.pair_status = None;
+                    self.set_state(proto::State::Login, None);
+                    self.broadcast(proto::EventLine::new(
+                        "pairing",
+                        &proto::PairingEvent {
+                            message: Some(message),
+                            ..Default::default()
+                        },
+                    ));
+                    if let Err(error) = self.start_pair(proto::PairMethod::Manual).await {
+                        self.broadcast(proto::EventLine::new(
+                            "pairing",
+                            &proto::PairingEvent {
+                                message: Some(error),
+                                ..Default::default()
+                            },
+                        ));
+                    }
+                }
+                pair::Pasted::Failed(message) => self.broadcast(proto::EventLine::new(
+                    "pairing",
+                    &proto::PairingEvent {
+                        message: Some(message),
+                        ..Default::default()
+                    },
+                )),
+                // The sign-in window was closed: the pairing is over, as with pair.cancel.
+                pair::Pasted::Quit => {
+                    self.pairing = None;
+                    self.pair_status = None;
+                    if self.state == proto::State::Pairing {
+                        self.set_state(proto::State::Login, None);
+                    }
+                }
+            },
+            Incoming::Line(conn, line) => self.request(conn, &line).await,
+        }
+    }
+
+    async fn request(&mut self, conn: u64, line: &str) {
+        let request = match proto::parse_request(line) {
+            Ok(request) => request,
+            Err(reply) => {
+                self.write(conn, &reply);
+                return;
+            }
+        };
+        let id = request.id;
+        if request.method == "hello" {
+            if self.clients.get(&conn).is_some_and(|c| c.mismatch) {
+                self.write(
+                    conn,
+                    &proto::Reply::err(id, proto::ErrorCode::ProtocolMismatch, "protocol mismatch"),
+                );
+                return;
+            }
+            match params::<proto::HelloParams>(request.params) {
+                Ok(hello) if hello.protocol == proto::PROTOCOL && id == Some(0) => {
+                    if let Some(client) = self.clients.get_mut(&conn) {
+                        client.handshaken = true;
+                    }
+                    self.write(conn, &proto::Reply::ok(id, json!({})));
+                }
+                Ok(_) => {
+                    if let Some(client) = self.clients.get_mut(&conn) {
+                        client.mismatch = true;
+                    }
+                    self.write(
+                        conn,
+                        &proto::Reply::err(
+                            id,
+                            proto::ErrorCode::ProtocolMismatch,
+                            "protocol mismatch",
+                        ),
+                    );
+                }
+                Err(error) => self.write(
+                    conn,
+                    &proto::Reply::err(id, proto::ErrorCode::BadRequest, error),
+                ),
+            }
+            return;
+        }
+        if self
+            .clients
+            .get(&conn)
+            .is_none_or(|c| !c.handshaken || c.mismatch)
+        {
+            self.write(
+                conn,
+                &proto::Reply::err(id, proto::ErrorCode::ProtocolMismatch, "hello required"),
+            );
+            return;
+        }
+        let Some(id) = id else {
+            self.write(conn, &proto::Reply::bad_request("id required"));
+            return;
+        };
+        if self.sync.is_none()
+            && !matches!(
+                request.method.as_str(),
+                "state" | "key.retry" | "pair.cancel"
+            )
+        {
+            self.write(conn, &self.unready(Some(id)));
+            return;
+        }
+        if self.pending.values().any(|p| p.conn == conn && p.id == id) {
+            self.write(
+                conn,
+                &proto::Reply::err(Some(id), proto::ErrorCode::Busy, "id already pending"),
+            );
+            return;
+        }
+        let mut reply = Ok(json!({}));
+        let mut outputs = Vec::new();
+        match request.method.as_str() {
+            "state" => reply = to_value(self.state_data()).map_err(|e| e.to_string()),
+            // The answer arrives as a state event; the lookup may wait on an unlock prompt.
+            "key.retry" => {
+                if matches!(
+                    self.state,
+                    proto::State::Locked | proto::State::KeyringMissing
+                ) {
+                    self.start_key();
+                }
+            }
+            "pair.cancel" => {
+                if let Some(pairing) = self.pairing.take() {
+                    pairing.abort();
+                }
+                self.pair_status = None;
+                if let Some(commands) = &self.commands {
+                    commands.send(phone::Command::CancelPairing);
+                }
+                if self.state == proto::State::Pairing {
+                    self.set_state(proto::State::Login, None);
+                }
+            }
+            "pair.start" => {
+                let busy = if self.state == proto::State::Pairing || self.pairing.is_some() {
+                    Some("pairing already in progress")
+                } else if self.state == proto::State::Ready {
+                    Some("already paired")
+                } else {
+                    None
+                };
+                if let Some(message) = busy {
+                    self.write(
+                        conn,
+                        &proto::Reply::err(Some(id), proto::ErrorCode::Busy, message),
+                    );
+                    return;
+                }
+                reply = match params::<proto::PairStartParams>(request.params) {
+                    Ok(p) => {
+                        match timeout(Duration::from_secs(15), self.start_pair(p.method)).await {
+                            Ok(result) => result,
+                            Err(_) => {
+                                self.write(
+                                    conn,
+                                    &proto::Reply::err(
+                                        Some(id),
+                                        proto::ErrorCode::Timeout,
+                                        "pairing timed out",
+                                    ),
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    Err(e) => Err(e),
+                };
+            }
+            "conversations" => {
+                reply = match params::<proto::ConversationsParams>(request.params) {
+                    Ok(p) if p.offset >= 0 && (1..=200).contains(&p.limit) => self
+                        .sync
+                        .as_mut()
+                        .map(|s| to_value(s.conversations(p.folder, p.offset, p.limit)).unwrap())
+                        .ok_or_else(|| "store unavailable".to_owned()),
+                    Ok(_) => Err("offset or limit out of range".into()),
+                    Err(e) => Err(e),
+                };
+            }
+            "history" => {
+                reply = match params::<proto::ConversationParams>(request.params) {
+                    Ok(p) if !p.conversation.is_empty() => self
+                        .sync
+                        .as_ref()
+                        .map(|s| to_value(s.history(&p.conversation)).unwrap())
+                        .ok_or_else(|| "store unavailable".into()),
+                    Ok(_) => Err("conversation required".into()),
+                    Err(e) => Err(e),
+                }
+            }
+            // Tells the phone, so unlike the store reads it needs a connection.
+            "read" if self.state != proto::State::Ready => {
+                self.write(conn, &self.unready(Some(id)));
+                return;
+            }
+            "read" => {
+                reply = match params::<proto::ConversationParams>(request.params) {
+                    Ok(p) if !p.conversation.is_empty() => {
+                        if let Some(sync) = &mut self.sync {
+                            outputs = sync.read(&p.conversation);
+                        }
+                        Ok(json!({}))
+                    }
+                    Ok(_) => Err("conversation required".into()),
+                    Err(e) => Err(e),
+                }
+            }
+            "focus" => {
+                reply = match params::<proto::FocusParams>(request.params) {
+                    Ok(p) => {
+                        if let Some(sync) = &mut self.sync {
+                            sync.set_focus(conn, p.conversation);
+                        }
+                        Ok(json!({}))
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            "media.open" | "media.save" => {
+                let save = request.method == "media.save";
+                match params::<proto::MediaParams>(request.params) {
+                    Ok(p) if !p.message.is_empty() => {
+                        let rid = self.next_rid;
+                        self.next_rid += 1;
+                        self.pending.insert(
+                            rid,
+                            Pending {
+                                conn,
+                                id,
+                                until: Instant::now() + Duration::from_secs(60),
+                            },
+                        );
+                        let out = self
+                            .sync
+                            .as_mut()
+                            .expect("store checked")
+                            .media(rid, &p.message, p.index, save);
+                        self.outputs(out);
+                        return;
+                    }
+                    Ok(_) => reply = Err("message required".into()),
+                    Err(e) => reply = Err(e),
+                }
+            }
+            "react" if self.state != proto::State::Ready => {
+                self.write(conn, &self.unready(Some(id)));
+                return;
+            }
+            "react" => match params::<proto::ReactParams>(request.params) {
+                Ok(p)
+                    if !p.conversation.is_empty()
+                        && !p.message.is_empty()
+                        && !p.emoji.is_empty() =>
+                {
+                    let rid = self.next_rid;
+                    self.next_rid += 1;
+                    self.pending.insert(
+                        rid,
+                        Pending {
+                            conn,
+                            id,
+                            until: Instant::now() + Duration::from_secs(15),
+                        },
+                    );
+                    self.sync.as_mut().expect("store checked").react(rid, p);
+                    return;
+                }
+                Ok(_) => reply = Err("conversation, message and emoji required".into()),
+                Err(e) => reply = Err(e),
+            },
+            "send" => {
+                reply = match params::<proto::SendParams>(request.params) {
+                    Ok(p) if p.conversation.is_empty() || p.text.is_empty() => {
+                        Err("conversation and text required".into())
+                    }
+                    Ok(p) if self.state == proto::State::Ready => {
+                        let rid = self.next_rid;
+                        self.next_rid += 1;
+                        self.pending.insert(
+                            rid,
+                            Pending {
+                                conn,
+                                id,
+                                until: Instant::now() + Duration::from_secs(120),
+                            },
+                        );
+                        if let Some(sync) = &mut self.sync {
+                            sync.send(rid, p.conversation, p.text, p.reply_to);
+                        }
+                        return;
+                    }
+                    Ok(_) => {
+                        self.write(conn, &self.unready(Some(id)));
+                        return;
+                    }
+                    Err(e) => Err(e),
+                };
+            }
+            _ => {
+                self.write(
+                    conn,
+                    &proto::Reply::err(Some(id), proto::ErrorCode::UnknownMethod, "unknown method"),
+                );
+                return;
+            }
+        }
+        self.outputs(outputs);
+        match reply {
+            Ok(data) => self.write(conn, &proto::Reply::ok(Some(id), data)),
+            Err(message) => self.write(
+                conn,
+                &proto::Reply::err(Some(id), proto::ErrorCode::BadRequest, message),
+            ),
+        }
+    }
+
+    fn unready(&self, id: Option<u64>) -> proto::Reply {
+        let locked = matches!(
+            self.state,
+            proto::State::Locked | proto::State::KeyringMissing | proto::State::StoreUnreadable
+        );
+        proto::Reply::err(
+            id,
+            if locked {
+                proto::ErrorCode::Locked
+            } else {
+                proto::ErrorCode::NotPaired
+            },
+            if locked {
+                "store unavailable"
+            } else {
+                "phone not paired"
+            },
+        )
+    }
+
+    async fn start_pair(&mut self, method: proto::PairMethod) -> Result<Value, String> {
+        if self.state == proto::State::Ready {
+            return Err("already paired".into());
+        }
+        if self.sync.is_none() {
+            return Err("store unavailable".into());
+        }
+        if self.pairing.is_some() {
+            return Err("pairing already in progress".into());
+        }
+        match method {
+            proto::PairMethod::Qr => {
+                if let Some(commands) = &self.commands {
+                    commands.send(phone::Command::PairQr);
+                }
+            }
+            proto::PairMethod::Google | proto::PairMethod::Manual => {
+                let mut pairing = pair::Pairing::start(method == proto::PairMethod::Manual)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if let Some(page) = pairing.page() {
+                    self.broadcast(proto::EventLine::new(
+                        "pairing",
+                        &proto::PairingEvent {
+                            manual_url: Some(page.url().to_owned()),
+                            ..Default::default()
+                        },
+                    ));
+                }
+                let tx = self.tx.clone();
+                let (status_tx, mut status_rx) = mpsc::channel(16);
+                self.pair_status = Some(status_tx);
+                self.pairing = Some(tokio::task::spawn_local(async move {
+                    loop {
+                        tokio::select! {
+                            pasted = pairing.next() => {
+                                let Some(pasted) = pasted else { break };
+                                let unavailable = matches!(pasted, pair::Pasted::Unavailable(_));
+                                if tx.send(Incoming::Pasted(pasted)).await.is_err() { return; }
+                                if unavailable { return; }
+                                // After cookies the page stays up, to show the emoji and the outcome.
+                            }
+                            status = status_rx.recv() => {
+                                let Some(status) = status else { break };
+                                let paired = matches!(status, PairStatus::Paired);
+                                if let Some(page) = pairing.page() {
+                                    match status {
+                                        PairStatus::Asking => page.asking(),
+                                        PairStatus::Emoji(emoji) => page.emoji(&emoji),
+                                        PairStatus::Failed(message) => page.failed(&message),
+                                        PairStatus::Paired => page.paired(),
+                                    }
+                                }
+                                if paired { pairing.finish(); let _ = tx.send(Incoming::PairDone).await; return; }
+                            }
+                        }
+                    }
+                    let _ = tx.send(Incoming::PairDone).await;
+                }));
+            }
+        }
+        self.set_state(proto::State::Pairing, None);
+        Ok(json!({}))
+    }
+}
+
+fn params<T: DeserializeOwned>(value: Value) -> Result<T, String> {
+    serde_json::from_value(value).map_err(|e| e.to_string())
+}
+
+fn lock(path: &Path) -> io::Result<File> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)?;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::WouldBlock {
+            return Err(error);
+        }
+        let mut pid = String::new();
+        let _ = file.read_to_string(&mut pid);
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            match pid.trim() {
+                "" => "already running".to_owned(),
+                pid => format!("already running (pid {pid})"),
+            },
+        ));
+    }
+    file.set_len(0)?;
+    file.write_all(std::process::id().to_string().as_bytes())?;
+    file.sync_data()?;
+    Ok(file)
+}
+
+pub(crate) fn clear_media(path: &Path) -> io::Result<()> {
+    if path.exists() {
+        std::fs::remove_dir_all(path)?;
+    }
+    paths::create_private_dir(path)
+}
+
+fn trim_log(path: &Path) -> io::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+    let len = file.metadata()?.len();
+    if len <= MAX_LINE as u64 {
+        return Ok(());
+    }
+    file.seek(SeekFrom::End(-(MAX_LINE as i64)))?;
+    let mut tail = Vec::with_capacity(MAX_LINE);
+    file.read_to_end(&mut tail)?;
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(&tail)
+}

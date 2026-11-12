@@ -58,7 +58,7 @@ impl PbLiteError {
     fn ty(expected: &'static str, got: &Json) -> Self {
         let mut s = got.to_string();
         if s.len() > 40 {
-            s.truncate(40);
+            s.truncate(s.floor_char_boundary(40));
             s.push('…');
         }
         PbLiteError::Type {
@@ -662,6 +662,17 @@ mod tests {
     use super::*;
     use crate::wire;
     use serde_json::json;
+
+    #[test]
+    fn type_error_truncates_multibyte_text_at_char_boundary() {
+        let value = Json::String("é".repeat(21));
+        let PbLiteError::Type { got, .. } = PbLiteError::ty("array", &value) else {
+            panic!("expected a type error");
+        };
+        let prefix = got.strip_suffix('…').expect("truncated error");
+        assert!(prefix.len() <= 40);
+        assert!(std::str::from_utf8(prefix.as_bytes()).is_ok());
+    }
 
     crate::message! {
         /// Test message.

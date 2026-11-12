@@ -4,7 +4,7 @@
 //! Reachable only from this computer, at a secret path (no other page, nor another user,
 //! can post to it), for its own host name only (no DNS rebinding).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::io;
 use std::rc::Rc;
 use std::time::Duration;
@@ -38,6 +38,7 @@ pub struct Page {
     url: String,
     stage: Rc<RefCell<Stage>>,
     server: JoinHandle<()>,
+    done: Cell<bool>,
 }
 
 impl Page {
@@ -46,7 +47,7 @@ impl Page {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
         let host = format!("127.0.0.1:{}", listener.local_addr()?.port());
         let mut secret = [0u8; 16];
-        getrandom::fill(&mut secret).map_err(io::Error::other)?;
+        getrandom::fill(&mut secret).map_err(|error| io::Error::other(error.to_string()))?;
         let token: String = secret.iter().map(|b| format!("{b:02x}")).collect();
         let url = format!("http://{host}/{token}");
         let stage = Rc::new(RefCell::new(Stage::Waiting));
@@ -62,7 +63,12 @@ impl Page {
                 }
             })
         };
-        Ok(Page { url, stage, server })
+        Ok(Page {
+            url,
+            stage,
+            server,
+            done: Cell::new(false),
+        })
     }
 
     pub fn url(&self) -> &str {
@@ -87,6 +93,7 @@ impl Page {
 
     /// Ready: says so, and stops serving a little later.
     pub fn done(&self) {
+        self.done.set(true);
         self.set(Stage::Done);
         let server = self.server.abort_handle();
         tokio::task::spawn_local(async move {
@@ -97,6 +104,14 @@ impl Page {
 
     fn set(&self, stage: Stage) {
         *self.stage.borrow_mut() = stage;
+    }
+}
+
+impl Drop for Page {
+    fn drop(&mut self) {
+        if !self.done.get() {
+            self.server.abort();
+        }
     }
 }
 
@@ -243,6 +258,20 @@ const PAGE: &str = include_str!("pair.html");
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn dropping_page_closes_listener() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (paste, _) = futures::channel::mpsc::unbounded();
+                let page = Page::serve(paste).await.unwrap();
+                let port = url::Url::parse(page.url()).unwrap().port().unwrap();
+                drop(page);
+                tokio::task::yield_now().await;
+                assert!(TcpStream::connect(("127.0.0.1", port)).await.is_err());
+            })
+            .await;
+    }
 
     #[test]
     fn emoji_image_like_libgm() {

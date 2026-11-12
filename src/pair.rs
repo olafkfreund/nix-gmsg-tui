@@ -1,17 +1,10 @@
-//! Pairing before the interface: native Google sign-in by default, or manual
-//! cookie import in the terminal or the local pairing page (see [`web`]), also when the
-//! sign-in window cannot open (no display, in a container or over SSH).
+//! Pairing through native Google sign-in or the local pairing page (see [`web`]).
 
 use std::collections::BTreeMap;
-use std::io::{self, Write};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::io;
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use crossterm::{execute, terminal};
 use futures::StreamExt;
-use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
+use futures::channel::mpsc::{UnboundedReceiver, unbounded};
 
 use crate::web;
 
@@ -51,23 +44,17 @@ pub enum Pairing {
 }
 
 impl Pairing {
-    pub async fn start(intro: &str, manual: bool) -> io::Result<Self> {
+    pub async fn start(manual: bool) -> io::Result<Self> {
         #[cfg(feature = "wry-signin")]
-        if !manual {
-            if !has_display() {
-                say("No display for the sign-in window: pairing from your browser instead.");
-            } else {
-                match crate::signin::Native::start(intro) {
-                    Ok(native) => return Ok(Self::Native(native)),
-                    Err(e) => say(&format!(
-                        "Cannot open the sign-in window ({e}): pairing from your browser instead."
-                    )),
-                }
-            }
+        if !manual
+            && has_display()
+            && let Ok(native) = crate::signin::Native::start("")
+        {
+            return Ok(Self::Native(native));
         }
         #[cfg(not(feature = "wry-signin"))]
         let _ = manual;
-        ManualPairing::start(intro).await.map(Self::Manual)
+        ManualPairing::start().await.map(Self::Manual)
     }
 
     /// Whether pairing is from the browser (cookies pasted), not in the sign-in window.
@@ -100,48 +87,19 @@ impl Pairing {
     }
 }
 
-/// A pairing under way: the cookies are pasted in the terminal or in the pairing page, served
-/// on localhost, which also shows the emoji to tap.
+/// A pairing page served on localhost, which also shows the emoji to tap.
 pub struct ManualPairing {
     pasted: UnboundedReceiver<Pasted>,
     page: web::Page,
-    stop: Arc<AtomicBool>,
-    terminal: Option<std::thread::JoinHandle<()>>,
 }
 
 impl ManualPairing {
-    /// Serves the page, tells where it is after `intro`, and reads the terminal.
-    pub async fn start(intro: &str) -> io::Result<Self> {
+    pub async fn start() -> io::Result<Self> {
         let (paste, pasted) = unbounded();
-        let page = web::Page::serve(paste.clone()).await?;
-        say(&format!(
-            "{intro}: open\n\n  {}\n\n\
-             Sign in to Google in a Firefox private window (with Chrome, Google ends the session).\n\n\
-             Or here: sign in to that account at {}, then in the developer tools (F12),\n\
-             Network, reload, right-click the `config` request, Copy as cURL, and paste it here.\n\
-             \n(Esc or Ctrl+C to quit; `--qr` pairs by QR code, if the phone still offers it.)",
-            link(page.url()),
-            link(SIGN_IN),
-        ));
-        let stop = Arc::new(AtomicBool::new(false));
-        let terminal = {
-            let stop = stop.clone();
-            std::thread::spawn(move || {
-                if let Err(e) = read_terminal(&stop, &paste) {
-                    let _ = paste
-                        .unbounded_send(Pasted::Failed(format!("Cannot read the terminal: {e}")));
-                }
-            })
-        };
-        Ok(ManualPairing {
-            pasted,
-            page,
-            stop,
-            terminal: Some(terminal),
-        })
+        let page = web::Page::serve(paste).await?;
+        Ok(Self { pasted, page })
     }
 
-    /// What is pasted next.
     pub async fn next(&mut self) -> Option<Pasted> {
         self.pasted.next().await
     }
@@ -150,88 +108,13 @@ impl ManualPairing {
         &self.page
     }
 
-    /// Paired and ready: the terminal goes back to the interface, the page says it is done.
-    pub fn finish(mut self) {
-        self.stop_terminal();
+    pub fn url(&self) -> &str {
+        self.page.url()
+    }
+
+    pub fn finish(self) {
         self.page.done();
     }
-
-    fn stop_terminal(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(terminal) = self.terminal.take() {
-            let _ = terminal.join();
-        }
-    }
-}
-
-impl Drop for ManualPairing {
-    fn drop(&mut self) {
-        self.stop_terminal();
-    }
-}
-
-/// Prints `text` as lines, also right while the terminal is raw (reading pastes).
-pub fn say(text: &str) {
-    let mut out = io::stdout().lock();
-    let _ = write!(out, "{}\r\n", text.replace('\n', "\r\n"));
-    let _ = out.flush();
-}
-
-/// `url`, clickable in terminals that know OSC 8 (the others show it as it is).
-fn link(url: &str) -> String {
-    format!("\x1b]8;;{url}\x1b\\{url}\x1b]8;;\x1b\\")
-}
-
-/// Reads the pastes until `stop`, the terminal raw meanwhile: a bracketed paste, or keys up
-/// to a pause after an Enter (terminals without bracketed paste).
-fn read_terminal(stop: &AtomicBool, paste: &UnboundedSender<Pasted>) -> io::Result<()> {
-    terminal::enable_raw_mode()?;
-    let _ = execute!(io::stdout(), event::EnableBracketedPaste);
-    let result = (|| {
-        let mut text = String::new();
-        let tick = Duration::from_millis(100);
-        while !stop.load(Ordering::Relaxed) {
-            if !event::poll(tick)? {
-                continue;
-            }
-            let pasted = match event::read()? {
-                Event::Paste(pasted) => pasted,
-                Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
-                    KeyCode::Esc => break,
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
-                    KeyCode::Char(c) => {
-                        text.push(c);
-                        continue;
-                    }
-                    // Pasted lines keep coming; a pause ends the paste.
-                    KeyCode::Enter
-                        if !text.trim().is_empty() && !event::poll(Duration::from_millis(300))? =>
-                    {
-                        std::mem::take(&mut text)
-                    }
-                    KeyCode::Enter => {
-                        text.push('\n');
-                        continue;
-                    }
-                    _ => continue,
-                },
-                _ => continue,
-            };
-            match parse(&pasted) {
-                Ok(cookies) => {
-                    let _ = paste.unbounded_send(Pasted::Cookies(cookies));
-                }
-                Err(e) => say(&format!("{e}. Paste again.")),
-            }
-        }
-        if !stop.load(Ordering::Relaxed) {
-            let _ = paste.unbounded_send(Pasted::Quit);
-        }
-        Ok(())
-    })();
-    let _ = execute!(io::stdout(), event::DisableBracketedPaste);
-    terminal::disable_raw_mode()?;
-    result
 }
 
 /// The cookies in `text`: a cURL command (Copy as cURL, from Chrome or Firefox), a `Cookie:`
