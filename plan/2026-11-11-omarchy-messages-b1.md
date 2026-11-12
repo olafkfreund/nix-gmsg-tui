@@ -385,6 +385,13 @@ path}`, which section 6 replaced with one `avatars {items}` event per batch.
      6. `phone.log` has counts only, with no ids.
      7. The journal shows no QML errors.
 
+## Deviations
+
+- Step 2: the new `phone::Conversation` fields made clippy flag `large_enum_variant` on
+  `serve.rs`'s `Incoming`, which is outside step 2's files. The lead added
+  `#[allow(clippy::large_enum_variant)]` with a reason: events go one at a time through
+  a channel, so boxing gains nothing.
+
 ## Probe result
 
 Run on p620 on 2026-11-12 against the owner's paired phone, with the unit stopped. The

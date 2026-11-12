@@ -31,6 +31,8 @@ const MAX_CLIENTS: usize = 32;
 /// Exit status when another daemon holds the lock; the unit does not restart on it.
 pub const ALREADY_RUNNING: u8 = 3;
 
+// One event at a time through a channel: boxing buys nothing.
+#[allow(clippy::large_enum_variant)]
 enum Incoming {
     Line(u64, String),
     Closed(u64),

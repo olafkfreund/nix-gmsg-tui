@@ -504,6 +504,8 @@ mod tests {
             folder: None,
             deleted: false,
             unread: true,
+            colour: "#1a73e8".into(),
+            avatar_id: Some("c:contact".into()),
         };
         let conv = Conversation::from_phone(&pc);
         assert_eq!(conv.folder, "inbox");

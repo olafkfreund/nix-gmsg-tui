@@ -423,6 +423,7 @@ impl Sync {
             }
             phone::Event::Done { .. }
             | phone::Event::Downloaded { .. }
+            | phone::Event::Avatars { .. }
             | phone::Event::Contacts { .. }
             | phone::Event::Started { .. } => {
                 tracing::debug!("stage-a phone event ignored");

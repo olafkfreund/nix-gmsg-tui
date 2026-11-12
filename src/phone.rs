@@ -13,6 +13,7 @@ use futures::StreamExt;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use gmessages_proto as gm;
 use serde::{Deserialize, Serialize};
+use tokio::time::Instant as TokioInstant;
 
 /// What the phone reports.
 #[derive(Debug)]
@@ -49,6 +50,12 @@ pub enum Event {
     Downloaded {
         id: u64,
         attachments: Vec<Attachment>,
+        error: Option<String>,
+    },
+    /// The pictures requested by `Avatars`, keyed by their prefixed ids.
+    Avatars {
+        id: u64,
+        images: Vec<(String, Vec<u8>)>,
         error: Option<String>,
     },
     /// A conversation looked up (`Lookup`) the phone no longer has.
@@ -143,6 +150,11 @@ pub enum Command {
         message: String,
         media: Vec<serde_json::Value>,
     },
+    /// Fetches contact and participant pictures: `Avatars`.
+    Avatars {
+        id: u64,
+        ids: Vec<String>,
+    },
     /// Sends to `conversation`: `Sent`.
     Send {
         id: u64,
@@ -219,6 +231,10 @@ pub struct Conversation {
     /// Not read on the phone.
     #[serde(default)]
     pub unread: bool,
+    #[serde(default)]
+    pub colour: String,
+    #[serde(default)]
+    pub avatar_id: Option<String>,
 }
 
 /// A message of a conversation, as the store keeps it.
@@ -654,6 +670,33 @@ fn conversation(c: &gm::Conversation) -> Conversation {
         folder: folder.map(str::to_string),
         deleted: c.is_deleted(),
         unread: c.unread,
+        colour: colour(c),
+        avatar_id: avatar_id(c),
+    }
+}
+
+fn colour(c: &gm::Conversation) -> String {
+    fn valid(value: &str) -> Option<String> {
+        let hex = value.strip_prefix('#').unwrap_or(value);
+        (hex.len() == 6 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then(|| format!("#{}", hex.to_ascii_lowercase()))
+    }
+    valid(&c.colour)
+        .or_else(|| c.other_participant().and_then(|p| valid(&p.colour)))
+        .unwrap_or_default()
+}
+
+fn avatar_id(c: &gm::Conversation) -> Option<String> {
+    if c.is_group {
+        return None;
+    }
+    let p = c.other_participant()?;
+    if !p.contact_id.is_empty() {
+        Some(format!("c:{}", p.contact_id))
+    } else if !p.id.is_empty() {
+        Some(format!("p:{}", p.id))
+    } else {
+        None
     }
 }
 
@@ -993,6 +1036,59 @@ async fn list_folder(
     (listed, false, None)
 }
 
+async fn avatars(state: &State, id: u64, ids: Vec<String>) -> Event {
+    let start = TokioInstant::now();
+    let deadline = start + Duration::from_secs(30);
+    let mut images = Vec::new();
+    let mut errors = Vec::new();
+    let contacts: Vec<String> = ids
+        .iter()
+        .filter_map(|s| s.strip_prefix("c:"))
+        .map(str::to_string)
+        .collect();
+    let participants: Vec<String> = ids
+        .iter()
+        .filter_map(|s| s.strip_prefix("p:"))
+        .map(str::to_string)
+        .collect();
+
+    match state.client() {
+        Ok(client) => {
+            if !contacts.is_empty() {
+                match tokio::time::timeout_at(deadline, client.contact_thumbnails(&contacts)).await
+                {
+                    Ok(Ok(found)) => {
+                        images.extend(found.into_iter().map(|t| (format!("c:{}", t.id), t.image)))
+                    }
+                    Ok(Err(e)) => errors.push(format!("contact thumbnails: {e}")),
+                    Err(e) => errors.push(format!("contact thumbnails: {e}")),
+                }
+            }
+            if !participants.is_empty() {
+                match tokio::time::timeout_at(
+                    deadline,
+                    client.participant_thumbnails(&participants),
+                )
+                .await
+                {
+                    Ok(Ok(found)) => {
+                        images.extend(found.into_iter().map(|t| (format!("p:{}", t.id), t.image)))
+                    }
+                    Ok(Err(e)) => errors.push(format!("participant thumbnails: {e}")),
+                    Err(e) => errors.push(format!("participant thumbnails: {e}")),
+                }
+            }
+        }
+        Err(e) => errors.push(e),
+    }
+    tokio::time::sleep_until(start + Duration::from_secs(2)).await;
+    Event::Avatars {
+        id,
+        images,
+        error: (!errors.is_empty()).then(|| errors.join("; ")),
+    }
+}
+
 /// Handles the commands of the interface until it stops.
 async fn run_commands(state: Rc<State>, mut commands: UnboundedReceiver<Command>) {
     while let Some(command) = commands.next().await {
@@ -1027,6 +1123,11 @@ async fn run_commands(state: Rc<State>, mut commands: UnboundedReceiver<Command>
                         },
                     };
                     state.emit(event);
+                });
+            }
+            Command::Avatars { id, ids } => {
+                tokio::task::spawn_local(async move {
+                    state.emit(avatars(&state, id, ids).await);
                 });
             }
             Command::Send {
@@ -1779,6 +1880,57 @@ mod tests {
     use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 
     use super::*;
+
+    fn one_to_one() -> gm::Conversation {
+        gm::Conversation {
+            participants: vec![gm::Participant {
+                id: "person".into(),
+                contact_id: "contact".into(),
+                colour: "#AABBCC".into(),
+                visible: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn conversation_colour_uses_valid_hex_and_participant_fallback() {
+        let mut c = one_to_one();
+        for (input, expected) in [
+            ("1A73E8", "#1a73e8"),
+            ("#1a73e8", "#1a73e8"),
+            ("", "#aabbcc"),
+            ("blue", "#aabbcc"),
+            ("#12345", "#aabbcc"),
+        ] {
+            c.colour = input.into();
+            assert_eq!(colour(&c), expected);
+        }
+        c.participants[0].colour = "blue".into();
+        assert_eq!(colour(&c), "");
+    }
+
+    #[test]
+    fn avatar_id_uses_visible_other_person_and_contact_first() {
+        let mut c = one_to_one();
+        assert_eq!(avatar_id(&c).as_deref(), Some("c:contact"));
+        c.participants[0].contact_id.clear();
+        assert_eq!(avatar_id(&c).as_deref(), Some("p:person"));
+        c.participants[0].id.clear();
+        assert_eq!(avatar_id(&c), None);
+        c.participants[0].id = "person".into();
+        c.participants[0].is_me = true;
+        assert_eq!(avatar_id(&c), None);
+        c.participants[0].is_me = false;
+        c.participants[0].visible = false;
+        assert_eq!(avatar_id(&c), None);
+        c.participants.clear();
+        assert_eq!(avatar_id(&c), None);
+        c = one_to_one();
+        c.is_group = true;
+        assert_eq!(avatar_id(&c), None);
+    }
 
     fn disconnected_state() -> Rc<State> {
         let (emit, _) = unbounded();
