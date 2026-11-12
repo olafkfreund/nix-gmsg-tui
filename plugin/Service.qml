@@ -139,6 +139,14 @@ Item {
         }
     }
 
+    // A window closed by the compositor (SUPER+W) cannot be shown again; drop it so the next open loads a fresh one.
+    Connections {
+        target: appLoader.item
+        function onClosed() {
+            Qt.callLater(function() { appLoader.active = false; });
+        }
+    }
+
     function toggleWindow() {
         if (!appLoader.active) {
             appLoader.active = true;
