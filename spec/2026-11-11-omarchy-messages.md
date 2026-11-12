@@ -265,8 +265,10 @@ Revised after Codex and agy review.
   - `contact_thumbnails` (action 29), keyed by `Participant.contact_id`. `types.rs:683`
     documents that id as "for avatars".
 - The plan's first step is a probe on the paired phone that decides between them, with
-  the unit stopped. The result is recorded in the plan. If both answer, action 37 wins,
-  because it also covers numbers that aren't in the address book.
+  the unit stopped. The result is recorded in the plan. The probe (2026-11-12) found
+  action 37 returned 1 picture in 50 and action 29 returned 8 in 16. By the owner's decision,
+  action 29 by `contact_id` is tried first, and action 37 by `Participant.id` covers
+  numbers that aren't in the address book.
 - Only 1:1 conversations get a picture:
   - the conversation must not be a group;
   - the participant is the one `other_participant()` returns (`types.rs:795`);

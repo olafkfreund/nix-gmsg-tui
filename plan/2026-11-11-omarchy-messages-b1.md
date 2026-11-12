@@ -37,13 +37,16 @@ path}`, which section 6 replaced with one `avatars {items}` event per batch.
 - Only 1:1 conversations get one: not a group, the participant that
   `gm::Conversation::other_participant()` (`gmessages-proto/src/types.rs:795`) returns,
   and a non-empty key.
-- The key is `Participant.id` for action 37 (`participant_thumbnails`), or
-  `Participant.contact_id` for action 29 (`contact_thumbnails`).
-- Step 1 decides which, and how `colour` arrives:
-  - If both actions answer, action 37 wins, because it also covers numbers that aren't
-    in the address book.
-  - If neither answers, the feature ships as initials circles only (see step 1), and
-    the owner is told.
+- The key (decided in step 1, owner's choice on 2026-11-12):
+  - `c:<contact_id>` when `Participant.contact_id` is set, fetched with action 29
+    (`contact_thumbnails`);
+  - otherwise `p:<id>`, from `Participant.id`, fetched with action 37
+    (`participant_thumbnails`).
+  - The prefix says which call fetches it. The phone layer splits each batch by prefix,
+    makes the two calls one after the other, and puts the prefix back on the returned
+    ids.
+- **Colour:** the conversation's `colour`, else the participant's. It is always `#rrggbb`
+  on this phone, and is lowercased; anything else becomes `""`.
 
 **Data:**
 - **`phone::Conversation`** gains:
@@ -247,16 +250,19 @@ path}`, which section 6 replaced with one `avatars {items}` event per batch.
    - `Conversation` (`:207`) gains `#[serde(default)] colour: String` and
      `#[serde(default)] avatar_id: Option<String>`.
    - `conversation()` (`:636`) fills them through two private functions:
-     - `colour(&gm::Conversation) -> String`, following the probe's rule;
-     - `avatar_id(&gm::Conversation) -> Option<String>`, with the probe's key. It returns
+     - `colour(&gm::Conversation) -> String`, with the rule under "Colour";
+     - `avatar_id(&gm::Conversation) -> Option<String>`, the prefixed key. It returns
        `None` for a group, when there's no participant, or for an empty key.
    - `Command` (`:128`) gains `Avatars { id: u64, ids: Vec<String> }`. Its handler, next
-     to `Download` (`:1015`), does what "Fetching" describes, with the probe's action.
+     to `Download` (`:1015`), does what "Fetching" describes. It splits `ids` by prefix:
+     `c:` goes to `contact_thumbnails` and `p:` to `participant_thumbnails`, one call after
+     the other, inside one 30 s timeout. The returned ids get their prefix back. If either
+     call fails, `error` is set, and the images from the other call are still returned.
    - `Event` (near `:49`) gains `Avatars { id, images, error }`. `src/sync.rs:424` lists
      it with the ignored stage-b events until step 4. That is the one allowed edit in
      `sync.rs`.
    - **Tests:**
-     - `colour`: `"1A73E8"`, `"#1a73e8"`, `"#FF1A73E8"` (if the probe saw 8 digits),
+     - `colour`: `"1A73E8"`, `"#1a73e8"`, 
        `""`, `"blue"` and `"#12345"`; and the participant fallback;
      - `avatar_id`: a group, no participants, an empty key, `is_me` only, a hidden
        participant, and the normal case.
@@ -381,7 +387,24 @@ path}`, which section 6 replaced with one `avatars {items}` event per batch.
 
 ## Probe result
 
-*(Filled in by step 1.)*
+Run on p620 on 2026-11-12 against the owner's paired phone, with the unit stopped. The
+probe was reverted, and the tree was clean afterwards.
+
+| Call | Ids asked | Returned | With an image | Not requested | Largest | Formats |
+|------|-----------|----------|---------------|---------------|---------|---------|
+| Action 37, `Participant.id` | 50 (1:1) | 1 | 1 | 0 | 16755 B | png |
+| Action 29, `Participant.contact_id` | 16 (of those 50, the ones with a contact id) | 8 | 8 | 0 | 24003 B | png |
+
+Colour shapes, across 1:1 conversations:
+- conversation colour: 771 `#rrggbb`, 99 empty;
+- participant colour: 870 `#rrggbb`, none in any other shape.
+
+**Decision:**
+- **Key:** action 29 by `contact_id` first, then action 37 by `Participant.id`. This
+  departs from the spec's "action 37 wins": action 37 found 1 picture in 50, action 29
+  found 8 in 16. The owner chose it when asked, on 2026-11-12, and the spec's line was
+  updated in the same commit.
+- **Colour:** the conversation's, falling back to the participant's.
 
 ## Tests
 
