@@ -20,7 +20,7 @@ pub struct Attachment {
 }
 
 /// Version of the schema, in `PRAGMA user_version`.
-const SCHEMA: i64 = 5;
+const SCHEMA: i64 = 6;
 
 /// Messages loaded per conversation at start: the most recent ones.
 const LOADED: i64 = 1000;
@@ -40,6 +40,9 @@ pub struct Conversation {
     pub hidden: bool,
     /// Out of the inbox: "archive", "spam", "trash".
     pub folder: Option<String>,
+    /// `#rrggbb`, or empty when unknown.
+    pub colour: String,
+    pub avatar_id: Option<String>,
     pub messages: Vec<phone::Message>,
 }
 
@@ -125,6 +128,15 @@ impl Store {
             )?;
             tx.commit()?;
         }
+        if version < 6 {
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "ALTER TABLE conversations ADD COLUMN colour TEXT;
+                 ALTER TABLE conversations ADD COLUMN avatar_id TEXT;
+                 PRAGMA user_version = 6;",
+            )?;
+            tx.commit()?;
+        }
         self.conn.pragma_update(None, "user_version", SCHEMA)?;
         Ok(())
     }
@@ -143,7 +155,8 @@ impl Store {
         let mut conversations = self
             .conn
             .prepare(
-                "SELECT id, name, is_group, hidden, folder, timestamp_ms, unread FROM conversations
+                "SELECT id, name, is_group, hidden, folder, timestamp_ms, unread,
+                 colour, avatar_id FROM conversations
                  ORDER BY timestamp_ms DESC",
             )?
             .query_map([], |row| {
@@ -155,6 +168,8 @@ impl Store {
                     folder: row.get(4)?,
                     timestamp_ms: row.get(5)?,
                     unread: row.get(6)?,
+                    colour: row.get::<_, Option<String>>(7)?.unwrap_or_default(),
+                    avatar_id: row.get(8)?,
                     messages: Vec::new(),
                 })
             })?
@@ -182,10 +197,14 @@ impl Store {
         {
             let mut save = tx.prepare(
                 "INSERT INTO conversations
-                 (id, name, is_group, timestamp_ms, latest, hidden, folder, unread)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 (id, name, is_group, timestamp_ms, latest, hidden, folder, unread,
+                  colour, avatar_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULLIF(?9, ''),
+                         CASE WHEN ?3 THEN NULL ELSE ?10 END)
                  ON CONFLICT (id) DO UPDATE SET name = ?2, is_group = ?3, timestamp_ms = ?4,
-                 latest = ?5, hidden = ?6, folder = ?7, unread = ?8",
+                 latest = ?5, hidden = ?6, folder = ?7, unread = ?8,
+                 colour = COALESCE(NULLIF(?9, ''), colour),
+                 avatar_id = CASE WHEN ?3 THEN NULL ELSE COALESCE(?10, avatar_id) END",
             )?;
             for c in conversations {
                 let latest = c.latest.as_ref().map(|l| &l.id);
@@ -197,7 +216,9 @@ impl Store {
                     latest,
                     c.deleted,
                     c.folder,
-                    c.unread
+                    c.unread,
+                    c.colour,
+                    c.avatar_id
                 ])?;
             }
         }
@@ -267,7 +288,8 @@ impl Store {
     /// The conversations `ids`, without their messages.
     pub fn conversations_hidden(&self, ids: &[String]) -> rusqlite::Result<Vec<Conversation>> {
         let mut select = self.conn.prepare(
-            "SELECT id, name, is_group, hidden, folder, timestamp_ms, unread FROM conversations WHERE id = ?1",
+            "SELECT id, name, is_group, hidden, folder, timestamp_ms, unread,
+             colour, avatar_id FROM conversations WHERE id = ?1",
         )?;
         ids.iter()
             .map(|id| {
@@ -280,6 +302,8 @@ impl Store {
                         folder: row.get(4)?,
                         timestamp_ms: row.get(5)?,
                         unread: row.get(6)?,
+                        colour: row.get::<_, Option<String>>(7)?.unwrap_or_default(),
+                        avatar_id: row.get(8)?,
                         messages: Vec::new(),
                     })
                 })
@@ -476,15 +500,15 @@ mod tests {
                 .conn
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            5
+            6
         );
     }
 
     #[test]
     fn refuses_newer_schema() {
-        let path = temp_path("v6");
+        let path = temp_path("v7");
         let store = Store::open(&path, "secret").unwrap();
-        store.conn.pragma_update(None, "user_version", 6).unwrap();
+        store.conn.pragma_update(None, "user_version", 7).unwrap();
         drop(store);
         let error = Store::open(&path, "secret").err().unwrap();
         assert!(error.to_string().contains("store from a newer version"));
@@ -510,6 +534,89 @@ mod tests {
         assert_eq!(store.unread_count().unwrap(), 0);
         store.set_unread("read", true).unwrap();
         assert_eq!(store.unread_count().unwrap(), 1);
+    }
+
+    fn v5_store(name: &str) -> std::path::PathBuf {
+        let path = temp_path(name);
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "key", "secret").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE conversations (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, is_group INTEGER NOT NULL,
+                timestamp_ms INTEGER NOT NULL, latest TEXT, synced TEXT,
+                hidden INTEGER NOT NULL DEFAULT 0, folder TEXT,
+                unread INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE messages (id TEXT PRIMARY KEY, conversation TEXT NOT NULL,
+                sent_ms INTEGER NOT NULL, data TEXT NOT NULL);
+             INSERT INTO conversations (id, name, is_group, timestamp_ms)
+                VALUES ('kept', 'Kept', 0, 123);
+             PRAGMA user_version = 5;",
+        )
+        .unwrap();
+        path
+    }
+
+    fn conv(id: &str, group: bool, colour: &str, avatar_id: Option<&str>) -> phone::Conversation {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "name": "N", "group": group, "timestamp_ms": 1,
+            "colour": colour, "avatar_id": avatar_id
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn migrates_v5_keeping_conversations() {
+        let path = v5_store("v5");
+        let store = Store::open(&path, "secret").unwrap();
+        let rows = store.conversations().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "Kept");
+        assert_eq!(rows[0].colour, "");
+        assert_eq!(rows[0].avatar_id, None);
+    }
+
+    #[test]
+    fn colour_and_avatar_round_trip() {
+        let store = Store::open(&temp_path("rt"), "secret").unwrap();
+        store
+            .save_conversations(&[conv("a", false, "#1a73e8", Some("c:x"))])
+            .unwrap();
+        for row in [
+            store.conversations().unwrap().remove(0),
+            store.conversations_hidden(&["a".into()]).unwrap().remove(0),
+        ] {
+            assert_eq!(row.colour, "#1a73e8");
+            assert_eq!(row.avatar_id.as_deref(), Some("c:x"));
+        }
+    }
+
+    #[test]
+    fn unknown_values_keep_what_is_stored() {
+        let store = Store::open(&temp_path("keep"), "secret").unwrap();
+        store
+            .save_conversations(&[conv("a", false, "#1a73e8", Some("c:x"))])
+            .unwrap();
+        store
+            .save_conversations(&[conv("a", false, "", None)])
+            .unwrap();
+        let row = store.conversations().unwrap().remove(0);
+        assert_eq!(row.colour, "#1a73e8");
+        assert_eq!(row.avatar_id.as_deref(), Some("c:x"));
+    }
+
+    #[test]
+    fn group_save_clears_avatar() {
+        let store = Store::open(&temp_path("grp"), "secret").unwrap();
+        store
+            .save_conversations(&[conv("a", false, "#1a73e8", Some("c:x"))])
+            .unwrap();
+        store
+            .save_conversations(&[conv("a", true, "", Some("c:y"))])
+            .unwrap();
+        let row = store.conversations().unwrap().remove(0);
+        assert_eq!(row.avatar_id, None);
+        assert_eq!(row.colour, "#1a73e8");
     }
 
     fn temp_path(name: &str) -> std::path::PathBuf {

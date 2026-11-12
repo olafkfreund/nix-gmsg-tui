@@ -518,6 +518,8 @@ mod tests {
             unread: true,
             hidden: false,
             folder: Some("archive".into()),
+            colour: String::new(),
+            avatar_id: None,
             messages: vec![m.clone()],
         };
         let from_store = Conversation::from_store(&sc);
