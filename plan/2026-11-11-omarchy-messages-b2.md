@@ -359,6 +359,27 @@ Thread root, keyed by `message + ":" + index` or by message id, not in delegates
   dropped, because `ToolTip` isn't imported in `Thread.qml`.
 - **Step 3, reaction errors:** a failed `react` shows its error in the composer's status
   line.
+- **Review fixes** (from the Codex, agy and Opus reviews of the diff):
+  - `Thread.qml`:
+    - An in-flight react is now `{busy: true}`. `setUi` had turned `true` into `{}`, so
+      the guard never blocked a second react.
+    - The emoji bar hides while the pointer is over an attachment row, so it no longer
+      covers Open and Save.
+  - `sync.rs`, the runtime file: written through a random temp file and renamed into
+    place.
+  - `sync.rs`, `media.save`: saves straight from the bytes and skips the runtime file.
+  - `sync.rs`, the cache: a result for a message that is gone isn't cached.
+  - `sync.rs`, `reset_media`: answers pending reacts with `not_paired`.
+  - `sync.rs`, saved file names:
+    - drop bidi and format characters;
+    - the 200-byte cut keeps the extension (one test covers both).
+  - `serve.rs`: expired requests are dropped before each phone event.
+  - `phone.rs`: the declared size is checked before `full()` as well as after.
+  - Not fixed:
+    - Saved files are 0600.
+    - `hard_link` fails on exFAT.
+    - A body with no declared size is still buffered whole before the cap applies.
+    - A race on the `full` listener after re-pairing.
 
 ## Tests
 

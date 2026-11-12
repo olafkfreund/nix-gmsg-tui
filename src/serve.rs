@@ -491,6 +491,7 @@ impl Daemon {
                 self.pair_status = None;
             }
             Incoming::Phone(event) => {
+                self.expire();
                 if let Some(status) = &self.pair_status {
                     let status_event = match &event {
                         phone::Event::Emoji { emoji } => Some(PairStatus::Emoji(emoji.clone())),

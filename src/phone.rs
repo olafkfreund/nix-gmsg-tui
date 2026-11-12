@@ -1504,6 +1504,7 @@ async fn download(
     for medium in media {
         let medium: Medium =
             serde_json::from_value(medium).map_err(|e| format!("bad medium stored: {e}"))?;
+        check_size(medium.size, 0)?;
         let medium = full(state, &client, message, medium).await;
         // The best there is: the medium, its preview, the small preview in the message.
         check_size(medium.size, 0)?;

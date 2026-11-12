@@ -106,7 +106,7 @@ Item {
     }
 
     // State that outlives delegates (mergeMessages replaces the array on every event):
-    // "m:<message>:<index>" -> {busy, err, saved}, "r:<message>" -> react in flight.
+    // "m:<message>:<index>" -> {busy, err, saved}, "r:<message>" -> {busy} while a react is in flight.
     property var ui: ({})
 
     function setUi(key, patch) {
@@ -151,7 +151,7 @@ Item {
 
     function react(msg, emoji) {
         var rk = "r:" + msg.id;
-        if (root.ui[rk] === true) return;
+        if ((root.ui[rk] || ({})).busy) return;
         var list = Array.isArray(msg.reactions) ? msg.reactions : [];
         var same = false, any = false;
         for (var i = 0; i < list.length; i++) {
@@ -161,7 +161,7 @@ Item {
             }
         }
         var op = same ? "remove" : (any ? "replace" : "add");
-        root.setUi(rk, true);
+        root.setUi(rk, { busy: true });
         root.client.send("react", { conversation: root.conversationId, message: msg.id, emoji: emoji, op: op }, function(r) {
             root.setUi(rk, null);
             if (!r.ok) {
@@ -360,10 +360,13 @@ Item {
                     readonly property bool isFailed: modelData.failed === true
                     readonly property bool isPending: modelData.pending === true
                     readonly property bool reactable: !isDeleted && !isFailed && !isPending
-                    readonly property bool reactBusy: root.ui["r:" + modelData.id] === true
+                    readonly property bool reactBusy: (root.ui["r:" + modelData.id] || ({})).busy === true
                     readonly property var reactions: Array.isArray(modelData.reactions) ? modelData.reactions : []
 
                     HoverHandler { id: rowHover }
+
+                    // The picker overlay would cover the Open/Save rows, so it hides while one is hovered.
+                    property bool attHover: false
 
                     Column {
                         id: rowCol
@@ -449,6 +452,8 @@ Item {
 
                                     readonly property string key: "m:" + String(bubbleRow.modelData.id) + ":" + att.index
                                     readonly property var st: root.ui[att.key] || ({})
+
+                                    HoverHandler { onHoveredChanged: bubbleRow.attHover = hovered }
 
                                     RowLayout {
                                         Layout.fillWidth: true
@@ -612,7 +617,7 @@ Item {
 
                     // Picker: an overlay on the top edge of the bubble, outside the layout, so hovering never moves the list.
                     Item {
-                        visible: bubbleRow.reactable && rowHover.hovered
+                        visible: bubbleRow.reactable && rowHover.hovered && !bubbleRow.attHover
                         z: 1
                         anchors.top: parent.top
                         width: parent.width

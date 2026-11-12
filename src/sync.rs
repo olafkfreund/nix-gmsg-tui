@@ -541,26 +541,14 @@ impl Sync {
         let path = self
             .media_dir
             .join(format!("{:x}{suffix}.{ext}", hash.finalize()));
-        let result = (|| -> io::Result<PathBuf> {
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&path)
-            {
-                Ok(mut file) => file.write_all(&a.bytes)?,
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error),
-            }
-            if waiter.save {
-                let downloads = self.downloads.as_ref().ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::NotFound, "no Downloads folder")
-                })?;
-                save_download(downloads, a, waiter.ms, ext)
-            } else {
-                Ok(path)
-            }
-        })();
+        let result = if waiter.save {
+            self.downloads
+                .as_ref()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no Downloads folder"))
+                .and_then(|downloads| save_download(downloads, a, waiter.ms, ext))
+        } else {
+            write_media(&path, &a.bytes).map(|()| path)
+        };
         match result {
             Ok(path) => proto::Out::Reply {
                 rid,
@@ -607,6 +595,7 @@ impl Sync {
                 height: a.height,
             };
             if a.full
+                && matches!(self.store.message(&message), Ok(Some(_)))
                 && let Err(error) = self.store.save_attachment(&message, index, &stored)
             {
                 tracing::warn!(%error, "cannot cache attachment");
@@ -682,7 +671,9 @@ impl Sync {
         self.waiters.clear();
         self.queues.clear();
         self.downloads_in_flight.clear();
+        let reacts: Vec<_> = self.reacts.drain().collect();
         ids.into_iter()
+            .chain(reacts)
             .map(|rid| Self::reply(rid, proto::ErrorCode::NotPaired, "phone not paired"))
             .collect()
     }
@@ -1095,6 +1086,29 @@ fn extension(mime: &str) -> &'static str {
     }
 }
 
+/// Writes `bytes` to `path` through a private temp file, so no reader sees a partial file.
+fn write_media(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    let mut random = [0u8; 8];
+    getrandom::fill(&mut random).map_err(|e| io::Error::other(e.to_string()))?;
+    let temp = path.with_extension(format!("{:016x}.tmp", u64::from_be_bytes(random)));
+    let result = (|| {
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp)?
+            .write_all(bytes)?;
+        fs::rename(&temp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
 fn save_download(dir: &Path, a: &store::Attachment, ms: i64, ext: &str) -> io::Result<PathBuf> {
     fs::create_dir_all(dir)?;
     let raw = a
@@ -1104,9 +1118,24 @@ fn save_download(dir: &Path, a: &store::Attachment, ms: i64, ext: &str) -> io::R
         .rsplit(['/', '\\'])
         .next()
         .unwrap_or("");
-    let mut name: String = raw.chars().filter(|c| !c.is_control()).collect();
-    while name.len() > 200 {
-        name.pop();
+    let mut name: String = raw
+        .chars()
+        .filter(|c| {
+            !c.is_control()
+                && !matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}')
+        })
+        .collect();
+    if name.len() > 200 {
+        // Cut the stem, keep a plausible extension.
+        let (stem, dot_ext) = match name.rsplit_once('.') {
+            Some((s, e)) if !s.is_empty() && e.len() <= 20 => (s, &name[s.len()..]),
+            _ => (name.as_str(), ""),
+        };
+        let mut end = 200 - dot_ext.len();
+        while !stem.is_char_boundary(end) {
+            end -= 1;
+        }
+        name = format!("{}{dot_ext}", &stem[..end]);
     }
     if name.is_empty() || name == "." || name == ".." || name.starts_with('.') {
         name = format!("message-{ms}.{ext}");
@@ -1485,6 +1514,33 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn save_name_drops_bidi_and_keeps_extension() {
+        let dir = std::env::temp_dir().join(format!("gm-name-{}", std::process::id()));
+        let long = format!("{}.jpeg", "é".repeat(150));
+        for (name, check) in [
+            ("a\u{202E}gpj.\u{200B}exe\u{FEFF}", "agpj.exe".to_string()),
+            (long.as_str(), String::new()),
+        ] {
+            let a = store::Attachment {
+                content_type: "image/jpeg".into(),
+                file_name: Some(name.into()),
+                bytes: b"x".to_vec(),
+                width: None,
+                height: None,
+            };
+            let sub = dir.join(format!("{}", check.len()));
+            let got = save_download(&sub, &a, 1, "jpg").unwrap();
+            let got = got.file_name().unwrap().to_str().unwrap().to_string();
+            if check.is_empty() {
+                assert!(got.len() <= 200 && got.ends_with(".jpeg"), "{got}");
+            } else {
+                assert_eq!(got, check);
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
