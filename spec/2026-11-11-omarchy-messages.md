@@ -1,5 +1,6 @@
 ---
-status: approved
+status: draft
+amendment: contact pictures in stage b (2026-11-12), awaiting approval
 issue: none (issues are disabled on the fork)
 intent: intent/2026-11-11-omarchy-messages.md
 ---
@@ -17,7 +18,7 @@ These are defaults, chosen from what p620 already does. Change any of them at re
 | 3 | How p620 gets it | The flake is an input of `~/.config/nixos`. A new host module, like `hosts/common/nixos/omarchy-omateams.nix`, imports `homeManagerModules.default` (package and user unit) and sets `programs.nixarchy.plugins."olafkfreund.gmessages".src` and `local.omarchy.enableOnce`. The flake's own module doesn't touch nixarchy options, so it evaluates anywhere. |
 | 4 | Secret Service on p620 | Whatever answers `org.freedesktop.secrets` on the session bus. The window reports "locked" or "missing"; we don't pick a provider. |
 | 5 | Panel or window | Its own floating window: manifest kind `panel`, entry `App.qml`, a Quickshell `FloatingWindow`, the same as omamail's panel opened as a window. It opens from the bar widget, a notification, or `omarchy-shell olafkfreund.gmessages toggle`. |
-| 6 | Stages | (a) packaging, backend, pairing, conversation list, history, send, badge, notifications; (b) media, reactions; (c) contacts and new chats, archive, restore, delete, unpair, remove all data. One plan per stage. This spec covers all three. |
+| 6 | Stages | (a) packaging, backend, pairing, conversation list, history, send, badge, notifications; (b) media, reactions, contact pictures; (c) contacts and new chats, archive, restore, delete, unpair, remove all data. One plan per stage. This spec covers all three. |
 
 **One deliberate change to the intent, for approval.** The intent said the backend stops
 on stdin EOF so that "a plugin reload or shell exit leaves nothing behind". This design
@@ -142,7 +143,7 @@ passes 1000 lines, is disconnected. It reconnects and starts over from `hello`.
 | Stage | Methods → reply data | Events |
 |-------|----------------------|--------|
 | a | `hello`; `state` → `{state, detail, unread}`; `key.retry`; `pair.start {method: google\|qr\|manual}`; `pair.cancel`; `conversations {folder, offset, limit≤200}` → `{items, total}`; `history {conversation}` → `{messages, truncated}`; `send {conversation, text, reply_to?}` → `{status: sent\|accepted, message}`; `read {conversation}`; `focus {conversation\|null}` | `state`, `pairing {emoji?, qr_svg?, manual_url?, message?}`, `conversation`, `history {conversation, messages}`, `message {conversation, message, notify}`, `missed {count}`, `unread {count}`, `typing` |
-| b | `media.open {message, index}` → `{path}`; `media.save {message, index}` → `{path}`; `react {conversation, message, emoji, op}` | — |
+| b | `media.open {message, index}` → `{path}`; `media.save {message, index}` → `{path}`; `react {conversation, message, emoji, op}`; conversation items gain `color` and `avatar` (section 6) | `avatar {conversation, path}` |
 | c | `contacts {offset, limit}`; `chat.start {numbers}`; `archive`, `restore`, `delete.chat {conversation}`; `delete.message {conversation, message}`; `unpair`; `uninstall` | `gone {conversation}` |
 
 **History:**
@@ -244,8 +245,62 @@ The same file shape as `nixarchy.meetingai`:
 - `gmessages-proto/src/codec.rs:61`: truncate on a char boundary, with a test using 21
   "é" characters.
 
+### 6. Contact pictures (stage b)
+
+Added on 2026-11-12, after the owner saw the stage a list on p620 without pictures.
+
+**What the user sees:**
+- Each row of the list has a round picture at the start, and the thread header has a
+  larger one.
+- A conversation with no picture shows a circle in the phone's colour for it, with the
+  initials of its name.
+- A group shows its initials circle. Group pictures (`group_avatar_url`) are out of scope.
+
+**Backend:**
+- **Which picture:** a 1:1 conversation uses its single participant that isn't us
+  (`is_me == false`, `visible`). The phone layer already has
+  `participant_thumbnails(ids)` (action 37, `gmessages-proto/src/client.rs:584`). The
+  daemon doesn't call it today.
+- **When it's fetched:**
+  - after each `conversations` reply and each `conversation` event, for participants
+    not yet tried in this run;
+  - in batches of up to 50 ids, at most one batch in flight;
+  - an id is tried once per daemon run. A participant with no picture, or a failed
+    call, isn't asked again until the unit starts again.
+  - Fetching only happens in `ready`. A failure is logged with a count, never the ids,
+    and never changes the state.
+- **Where it's kept:** `runtime/avatars/<sha256(participant id)>`, mode 0600, the same as
+  decrypted media.
+  - It's written atomically: written beside the target, then renamed.
+  - The runtime dir is tmpfs, mode 0700, and cleared on stop. Pictures are never written
+    to the persistent cache, because the store they come from is encrypted.
+  - Each start fetches them again, which costs one batch per 50 contacts.
+  - A response that isn't JPEG, PNG or WebP (checked by its magic bytes), or that is
+    over 512 KiB, is dropped.
+- **Protocol:**
+  - Conversation items gain `color` (the phone's hex colour, or `""`) and `avatar` (an
+    absolute path, or `null`).
+  - When a picture lands, the daemon broadcasts `avatar {conversation, path}` once for
+    every conversation that uses that participant.
+  - `avatar` is additive, so the protocol stays at 1, and stage a clients ignore it.
+  - No secret fields are added, and the no-secrets test covers the new fields.
+
+**Plugin:**
+- **`Avatar.qml`:** an `Image` from `file://` + path, clipped to a circle with
+  Quickshell's `ClippingRectangle`. With no path, or when the image fails to load, it
+  shows the initials circle instead.
+- **Size and colour:** 32 px in the list and 40 px in the thread header, at the theme
+  scale. Initials use the theme font on `color`, or on the theme's surface colour when
+  `color` is empty.
+- **Updates:** `ConversationList` and `Thread` set the path from the `avatar` event. The
+  image reloads when the path changes.
+
 ## Alternatives rejected
 
+- **Contact pictures in `~/.cache` or in the store:** a persistent plaintext cache would
+  leak what the encrypted store protects; a store table means a migration for data the
+  phone serves again in one call per 50 contacts.
+- **Fetching pictures in QML:** the phone layer and its session live in the daemon only.
 - **stdin/stdout child of `Service.qml` (omamail):** the bar and the window would go
   through one instance, and a plugin reload would drop the Google session.
 - **D-Bus API:** more code than NDJSON. Quickshell has `Socket`, and meetingai proves
@@ -261,6 +316,10 @@ The same file shape as `nixarchy.meetingai`:
   either.
 
 ## Risks
+
+- Contact pictures: action 37's request shape is from the reverse-engineered client and
+  unverified here; if the phone rejects it, the list keeps the initials circles and the
+  daemon logs the failure once per batch.
 
 - **Google refuses the embedded window:** the manual localhost page is the fallback.
   Checked by hand.
@@ -301,6 +360,8 @@ switch, and the checks are done together:
    without pairing.
 6. A locked keyring shows `locked`, and unlocking with retry recovers.
 7. A theme switch and a rounding change apply live.
-8. Stage b: an image opens and saves. A reaction reaches the phone.
+8. Stage b: an image opens and saves. A reaction reaches the phone. Contacts with a
+   picture on the phone show it in the list and the thread header; the others show
+   initials. After the unit starts again, the pictures come back without pairing.
 9. Stage c: a new chat starts. Archive and restore work, and delete asks first. Unpair
    keeps the store; uninstall removes everything.
