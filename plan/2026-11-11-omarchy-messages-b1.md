@@ -4,11 +4,11 @@ issue: none (issues are disabled on the fork)
 spec: spec/2026-11-11-omarchy-messages.md
 stage: b1 (contact pictures; spec section 6). Media and reactions get their own stage b plan.
 coders:
-  1: codex   # phone layer: new command and event, colour and id choice, timeout and pacing
-  2: claude  # live probe on the paired phone: needs the session and the owner's phone
-  3: coder   # store migration v6: two nullable columns, plain SQL and a test
-  4: codex   # Sync queue, image checks, file lifecycle, session guard: small, tricky logic
-  5: coder   # QML: Avatar.qml and wiring in four files, following the existing patterns
+  1: claude  # live probe on the paired phone: needs the session, the unit and the owner's phone
+  2: codex   # phone layer: command, event, colour and id choice, timeout and pacing
+  3: coder   # store migration v6: two nullable columns, merge rule, tests
+  4: codex   # Sync queue, batch tokens, image checks, file lifecycle: small, tricky logic
+  5: coder   # QML: Avatar.qml and reactive bindings in four files
 reviewers:
   - codex   # independent read of the whole diff against this plan
   - agy     # second independent read; disagreement is the point
@@ -16,121 +16,159 @@ reviewers:
 
 # Plan: Messages plugin, stage b1: contact pictures
 
+Revised after Codex and agy reviewed the first draft (3da5fb8). The probe now comes
+first, before any production code, as the spec requires.
+
 ## What is decided (copied from the approved spec, section 6)
 
+Section 6 governs. The stage table in spec section 2 still says `avatar {conversation,
+path}`, which section 6 replaced with one `avatars {items}` event per batch.
+
 **What the user sees:**
-- Each list row has a round picture at its start, 32 px, and the thread header has one
-  at 40 px, both at the theme scale.
-- A conversation with no picture gets a circle in the phone's colour with the initials of
-  its name:
-  - The initials are the first letter of the first two words, split on code points.
-  - A name that is a number, or has no letters, shows a person icon instead.
+- A round picture starts each list row (32 px) and the thread header (40 px), both at
+  the theme scale.
+- With no picture, a circle in the conversation's colour shows the initials of its name:
+  the first letter of the first two words, split on code points.
+  - A word counts only if it starts with a letter (`/\p{L}/u`).
+  - With no such word (a number, a short code), it shows a person icon.
 - Groups always get the initials circle. Group pictures are out of scope.
 
 **Which picture:**
-- Only 1:1 conversations get one:
-  - the conversation is not a group;
-  - the participant is the one `gm::Conversation::other_participant()` returns
-    (`gmessages-proto/src/types.rs:795`);
-  - its id is not empty.
-- Two phone calls take the same request shape:
-  - action 37, `participant_thumbnails`, keyed by `Participant.id`;
-  - action 29, `contact_thumbnails`, keyed by `Participant.contact_id`.
-- Step 2 probes both against the paired phone. If both answer, action 37 wins, because it
-  also covers numbers that aren't in the address book. If neither answers, the feature
-  ships as initials only, and the owner is told.
+- Only 1:1 conversations get one: not a group, the participant that
+  `gm::Conversation::other_participant()` (`gmessages-proto/src/types.rs:795`) returns,
+  and a non-empty key.
+- The key is `Participant.id` for action 37 (`participant_thumbnails`), or
+  `Participant.contact_id` for action 29 (`contact_thumbnails`).
+- Step 1 decides which, and how `colour` arrives:
+  - If both actions answer, action 37 wins, because it also covers numbers that aren't
+    in the address book.
+  - If neither answers, the feature ships as initials circles only (see step 1), and
+    the owner is told.
 
 **Data:**
-- `phone::Conversation` gains two fields:
-  - `colour`: `#rrggbb` (lower case), or `""` when the phone's value isn't six hex digits,
-    with or without `#`;
-  - `avatar_id`: `Option<String>`, the id chosen above.
-- The store's `conversations` table gains the nullable `colour` and `avatar_id` (migration
-  v6). Image bytes never go into SQLite.
-- `Sync` keeps, in memory:
+- **`phone::Conversation`** gains:
+  - `colour: String`: `#rrggbb` in lower case, or `""`;
+  - `avatar_id: Option<String>`: the chosen key, or `None` for a group or when it's
+    unknown.
+- **The store's merge rule:** keep the stored value unless the new one is known.
+  ```sql
+  colour    = COALESCE(NULLIF(?colour, ''), colour)
+  avatar_id = CASE WHEN ?is_group THEN NULL ELSE COALESCE(?avatar_id, avatar_id) END
+  ```
+  - The other person of a 1:1 conversation never changes. A partial phone update with
+    no participants must not erase what's known.
+  - A group never has an avatar_id.
+- **`Sync` keeps, in memory:**
+  - `meta`: a map from conversation id to `(colour, Option<avatar_id>)`, loaded from the
+    store at start and updated with the same merge rule on every phone conversation;
   - `avatars`: a map from avatar_id to path;
-  - `queue`: a deduplicated `VecDeque` of ids;
-  - `tried`: a set of ids;
-  - `failed_once`: a set of ids;
-  - `in_flight`: `Option<u64>`, the batch token;
-  - `ready`: a bool.
-- Every conversation the daemon sends carries `avatar` from that map: `from_phone`,
-  `from_store`, and every `conversations` reply.
+  - `queue`: a `VecDeque` of avatar_ids;
+  - `tried`: a set;
+  - `failed_once`: a set;
+  - `in_flight`: `Option<(u64 token, Vec<String> ids)>`;
+  - `next_token`: a `u64`;
+  - `ready`: a bool;
+  - `avatar_dir`: a `PathBuf`.
+- **Outgoing conversations:** every conversation the daemon sends gets `color` and
+  `avatar` from `meta` and `avatars`. That covers `conversations` replies, `conversation`
+  events from the phone or the store, and the `Gone` path at `src/sync.rs:382`. A
+  partial update never blanks a known colour or picture.
 
 **Fetching:**
-- **What gets queued:**
-  - the avatar_id of each item in a `conversations` reply;
-  - the avatar_id of each live `conversation` event while `ready`.
-  - `Event::Ready`'s bulk conversations don't queue anything.
-  - Ids already in `tried` or `avatars`, or already queued, are skipped.
-- **Sending a batch:** up to 50 ids, when `ready`, nothing is in flight, and the queue
-  isn't empty. This is checked when entering `ready`, after queueing, and when a batch
-  finishes.
-  - The phone layer runs the call with `spawn_local`, under a 30 s timeout.
-  - It emits the result no sooner than 2 s after the call started. That gap between
-    batches is the pacing.
-- **Results:**
-  - An entry whose id wasn't requested is ignored.
-  - A missing entry, or an empty `image`, goes into `tried`.
-  - On a failed batch, ids go back into the queue once (`failed_once`). On a second
-    failure they go into `tried`.
-  - The log line has counts only, never ids.
-  - A result whose token isn't `in_flight` is dropped. The token changes on `Unpaired`,
-    `Expired`, `Fatal`, `Login` and every new pairing.
-- **Image checks:** a result is kept only when:
+- **Queueing:** an avatar_id is queued when it isn't already queued, in flight, in
+  `tried` or in `avatars`. It comes from:
+  - every item of a `conversations` reply;
+  - the `phone::Event::Conversation` arm (`src/sync.rs:344`), when `ready`.
+- **Never queued:** the shared helper `Sync::conversation()`. `Event::Ready` calls it in
+  bulk, twice when the first page is `partial`.
+- **`pump()`:** when `ready`, nothing is in flight and the queue isn't empty, it takes up
+  to 50 ids and sends `Command::Avatars { id: token, ids }` with a fresh token per batch.
+  It runs after queueing, on `Event::Ready`, and after each result.
+- **The phone layer:**
+  - runs the call with `spawn_local` under `tokio::time::timeout(30 s)`;
+  - emits `Event::Avatars { id, images: Vec<(String, Vec<u8>)>, error: Option<String> }`
+    no sooner than 2 s after the call started, using `tokio::time::Instant`. That gap is
+    the pacing.
+- **Results:** a result whose token isn't the one in flight is dropped. Otherwise, for
+  the ids in flight:
+  - an image that passes the checks gets written, and its path recorded;
+  - an id that's missing from the result, has an empty image, or fails the checks goes
+    into `tried`;
+  - an entry for an id that wasn't requested is ignored;
+  - on `error`, every id in flight goes back into the queue once (`failed_once`), then
+    into `tried` on a second failure.
+  - The log has counts only, never ids.
+- **Losing `ready`:** on any phone event other than `Ready` that sets a non-ready state
+  (`Login`, `Paired`, `Connected`, `Expired`, `Unpaired`, `Fatal`):
+  - clear `ready`;
+  - put the ids in flight back at the front of the queue;
+  - set `in_flight` to `None`, so the late result's token no longer matches.
+- **`Paired` and `Unpaired`** (a new or different account) also empty `avatars`,
+  `queue`, `tried` and `failed_once`, and clear `avatar_dir`.
+- **Image checks:** an image is kept only when:
   - its magic bytes are JPEG (`FF D8 FF`), PNG (`89 50 4E 47 0D 0A 1A 0A`) or WebP
-    (`RIFF....WEBP`);
+    (`RIFF` at 0 and `WEBP` at 8);
   - it is at most 256 KiB;
   - `imagesize::blob_size` gives at most 1024 px per side.
 - **Files:**
-  - Path: `runtime/avatars/<hex sha256(image)>.<jpg|png|webp>`. The directory is mode
-    0700.
-  - Each file is written as a temp file in the same directory, opened with
-    `OpenOptionsExt::mode(0o600)` and `create_new`, then renamed.
-  - The daemon builds each path itself.
-- **Lifecycle:** `runtime/avatars` is cleared along with `runtime/media`:
-  - at start and at stop;
-  - on `Event::Unpaired`, which also empties `avatars`, `queue`, `tried`, `failed_once`
-    and `in_flight`;
+  - Path: `avatar_dir/<sha256 hex of the image>.<jpg|png|webp>`. The directory is 0700.
+  - If that file already exists, it is reused.
+  - Otherwise it's written to `.<name>.tmp`, opened with `create_new` and
+    `OpenOptionsExt::mode(0o600)`, after removing any leftover. Then it's renamed.
+  - The daemon builds every path itself.
+- **Lifecycle:** `runtime/avatars` is cleared:
+  - at start and stop, along with `runtime/media`;
+  - on `Paired` and `Unpaired`;
   - on `unpair` and `uninstall`, which are stage c.
 
 **Protocol:**
-- Conversation items gain:
-  - `color`: `#rrggbb` or `""`;
-  - `avatar`: an absolute path, or `null`.
-- New event: `avatars {items: {<conversation id>: <path>}}`, one per batch. It lists every
-  conversation whose avatar_id got a picture.
-- The protocol stays at version 1. Stage a clients ignore unknown events and fields.
-- The no-secrets test covers the new fields.
+- Conversation items gain `color` (`#rrggbb` or `""`) and `avatar` (an absolute path or
+  `null`).
+- New event `avatars {items: {<conversation id>: <path>}}`, at most one per batch:
+  - It lists the conversations whose avatar_id got a path in that batch, found through
+    `meta`.
+  - It's skipped when empty.
+- The protocol stays at version 1. The no-secrets test covers the new fields.
 
 **Plugin:**
-- **`Avatar.qml`** takes the properties `path`, `color`, `name`, `group` and `size`:
-  - An `Image` with `source: path ? "file://" + path : ""`, `asynchronous: true` and
-    `sourceSize` set to the size, inside a `ClippingRectangle` (`Quickshell.Widgets`)
-    with radius size/2.
-  - On `Image.Error`, or when there's no path, it shows the initials circle instead. Its
-    text colour is chosen for contrast with `color`, which falls back to the theme's
-    surface colour.
-- **`ConversationList`:**
-  - It keeps `property var avatars: ({})`, from conversation id to path, separate from the
-    rows.
-  - Items and the `avatars` event write to it. The delegate reads
-    `root.avatars[modelData.id]`.
-  - One event changes the map once: it builds a new object and assigns it once.
-- **`App.qml`:** passes the selected conversation's `avatar`, `color`, `name` and `group`
-  to `Thread`'s header, including a thread opened from a notification.
+- **`Avatar.qml`:**
+  - Properties:
+    - `required property var theme`;
+    - `property string path`, `color` and `name`;
+    - `property bool group`;
+    - `property real size`.
+  - When `group` is false and `path` isn't empty: an `Image` with
+    `source: "file://" + path`, `asynchronous: true` and `sourceSize` set to the size,
+    inside a `ClippingRectangle` (`Quickshell.Widgets`) with radius size/2.
+  - Otherwise, or on `Image.Error`: the initials circle. Its fill is `color`, or
+    `Commons.Color.surface` when that's empty, and its text colour is chosen for contrast.
+- **`ConversationList.qml`:**
+  - `property var avatars: ({})`, from conversation id to path, separate from the rows.
+    Item paths, from pages and upserts, and the `avatars` event write to it, each with
+    one assignment of a new object.
+  - The map is emptied when the client state becomes `login`.
+  - `readonly property var selectedItem`, the `allItems` entry for `selectedId`, or
+    `null`.
+  - `upsertConversation` keeps `color` when an update's is empty, as it already does
+    for `snippet`.
+- **`App.qml`:** binds the thread header reactively:
+  - `conversationAvatar: convList.avatars[root.activeConversation] || ""`;
+  - `conversationColor` and `conversationGroup` from `convList.selectedItem`.
+  - This way a picture that arrives late, or a thread opened from a notification, updates
+    on its own. `conversationSelected` keeps its signature.
 
 ## Rules for every step
 
-- **Coders (codex, agy, coder):**
+- **Coders (codex, coder):**
   - Edit only the files their step lists.
   - May run, inside `nix develop -c …`: `cargo build`, `cargo test`, `cargo clippy`,
     `cargo fmt` and `qmllint`. In step 4 only, they may also run
-    `cargo add imagesize --package gmessages-tui`.
+    `cargo add imagesize sha2@0.10 --package gmessages-tui`. `sha2` 0.10.9 is already
+    in `Cargo.lock`.
   - Never run `nix build` or `nix flake check`. Never stage, commit, push, deploy or
     switch, never touch services, and never touch `~/.config/nixos`, `main` or another
     host.
-- **Claude (session):** runs step 2 and every line marked *(Claude)*. It reviews each
+- **Claude (session):** runs step 1 and every line marked *(Claude)*. It reviews each
   step's diff against this plan, and commits each step as its own commit naming the step.
   A coder's reported deviation is written into this plan in the same commit.
 - **A step is done when:** its verify passes,
@@ -140,180 +178,231 @@ reviewers:
   of tests run.
 - **Repo traps:**
   - The runtime is single-threaded (`LocalSet`, `Rc`), so async code uses `spawn_local`
-    and never needs `Send`.
+    and never needs `Send`. `phone.rs:10` imports `std::time::Instant`; the pacing uses
+    `tokio::time::Instant`.
+  - `phone` and `store` carry `#[allow(dead_code)]` at module level (`main.rs:9`,
+    `main.rs:17`). `sync` and `proto` don't, so anything new there must be used by the
+    end of step 4.
   - `phone::Conversation` is `Serialize`/`Deserialize`, so new fields get
-    `#[serde(default)]`.
-  - Every exhaustive `phone::Conversation { … }` literal in tests must gain the new
-    fields: `src/proto.rs:493` and `src/sync.rs:578`.
-  - The plugin ships under `v-<hash>/` (`nix/plugin.nix`). Shell QML errors show only
-    in the journal, so after a deploy check
-    `journalctl --user --since -5min | grep -i gmessages`.
-  - QuickShell's `FloatingWindow` has no `active` and no `appId`.
+    `#[serde(default)]`. The `src/sync.rs:578` fixture builds it from JSON and needs no
+    edit.
+  - Exhaustive literals:
+    - `phone::Conversation` at `src/proto.rs:493`;
+    - `store::Conversation` at `src/proto.rs:511`, and the two constructors at
+      `src/store.rs:150` and `src/store.rs:275` (`conversations_hidden`).
+  - The plugin ships under `v-<hash>/` (`nix/plugin.nix`). Shell QML errors show only in
+    the journal, and parse-only qmllint catches neither bindings nor types, so check
+    after a deploy:
+    ```sh
+    journalctl --user --since -5min | grep -i gmessages
+    ```
+  - Quickshell's `FloatingWindow` has no `active` and no `appId`.
   - A shell hook blocks commands whose text mentions restarting services or rebooting.
-    Use a script file for the unit stop and start.
+    The unit stop and start go in a script file.
 
 ## Steps
 
-1. **Phone layer** (`src/phone.rs`). *coder: codex*
-   - **Fields:**
-     - `Conversation` (`:207`) gains `#[serde(default)] pub colour: String` and
-       `#[serde(default)] pub avatar_id: Option<String>`.
-     - `conversation()` (`:636`) fills them with two new private functions,
-       `colour(&str) -> String` and `avatar_id(&gm::Conversation) -> Option<String>`.
-     - For now `avatar_id` uses `other_participant()`'s `id`, the action 37 key. A
-       constant `AVATAR_BY_CONTACT: bool = false` switches it to `contact_id`.
-   - **Command:**
-     - `Command` (`:128`) gains `Avatars { id: u64, ids: Vec<String> }`.
-     - The handler (near `:1015`, the `Download` arm) runs
-       `client.participant_thumbnails(&ids)`, or `contact_thumbnails` when
-       `AVATAR_BY_CONTACT` is set, inside `tokio::time::timeout(30 s)`.
-     - It then sleeps until 2 s after the start, and emits
-       `Event::Avatars { id, images: Vec<(String, Vec<u8>)>, error: Option<String> }`.
-   - **Event:** add `Avatars` to `Event` (near `:49`). `src/sync.rs:424` ignores it until
-     step 4.
-   - **Tests** in `phone.rs`:
-     - `colour`: `"1A73E8"`, `"#1a73e8"`, `""`, `"blue"` and `"#12345"`;
-     - `avatar_id`: a group, an empty id, `is_me` only, a hidden participant, and the
-       normal case.
-   - **Test literals:** `src/proto.rs:493` and `src/sync.rs:578` get the new fields.
-     Those are the only edits outside `phone.rs`.
+1. **Probe: which action, and what `colour` looks like** *(Claude, with the owner)*
+   - **Before the probe:**
+     - The working tree is clean.
+     - The probe lives in one patch file, `scratchpad/probe-avatars.patch`, touching only
+       `src/phone.rs`.
+     - In `list_conversations`, after the final `Event::Ready` (`src/phone.rs:905`), it
+       spawns a task that takes up to 50 1:1 conversations from `listed`.
+   - **What the task does:**
+     1. Calls `participant_thumbnails` with their `Participant.id`s.
+     2. Waits 2 s.
+     3. Calls `contact_thumbnails` with their non-empty `contact_id`s, each under a 30 s
+        timeout.
+     4. Logs one info line per call with: ids asked, entries returned, non-empty images,
+        returned ids that weren't requested, image formats by magic bytes, the largest
+        byte size, and whether the call errored.
+     5. Logs one line counting `Conversation.colour` and `Participant.colour` values by
+        shape: empty, `#`+6, 6, `#`+8, 8, or other.
+     6. Writes the line `probe done` to stderr.
+   - **The run** is a script file, `scratchpad/probe-avatars.sh`, under a `trap` that
+     always kills the probe with SIGTERM and starts the unit again:
+     1. stop the `gmessages-tui` user unit;
+     2. `nix develop -c cargo run -- serve` in the foreground;
+     3. wait for `probe done`, or 120 s;
+     4. SIGTERM, so `control.stop()` saves the session;
+     5. start the unit;
+     6. print only the probe lines.
+   - **After the run:**
+     - Revert with `git apply -R scratchpad/probe-avatars.patch`, then check that
+       `git status --porcelain` is empty.
+     - Record the counts and the decision under "Probe result" below, in a plan-only
+       commit: which action and key, and the `colour` rule. For 8-digit values, drop the
+       ARGB alpha. When the conversation colour is empty, use the participant's.
+   - **If both actions return zero images:**
+     - Before deciding, ask the owner whether any of the sampled contacts has a picture
+       on the phone.
+     - If they do, stop and ask.
+     - If not, the plan shrinks to colour and initials: step 2 drops the command and
+       event, step 4 drops fetching, and step 5 is unchanged.
+   - Verify: the probe result is committed, and the tree is otherwise clean.
+
+2. **Phone layer** (`src/phone.rs`, plus the literal at `src/proto.rs:493`).
+   *coder: codex*
+   - `Conversation` (`:207`) gains `#[serde(default)] colour: String` and
+     `#[serde(default)] avatar_id: Option<String>`.
+   - `conversation()` (`:636`) fills them through two private functions:
+     - `colour(&gm::Conversation) -> String`, following the probe's rule;
+     - `avatar_id(&gm::Conversation) -> Option<String>`, with the probe's key. It returns
+       `None` for a group, when there's no participant, or for an empty key.
+   - `Command` (`:128`) gains `Avatars { id: u64, ids: Vec<String> }`. Its handler, next
+     to `Download` (`:1015`), does what "Fetching" describes, with the probe's action.
+   - `Event` (near `:49`) gains `Avatars { id, images, error }`. `src/sync.rs:424` lists
+     it with the ignored stage-b events until step 4. That is the one allowed edit in
+     `sync.rs`.
+   - **Tests:**
+     - `colour`: `"1A73E8"`, `"#1a73e8"`, `"#FF1A73E8"` (if the probe saw 8 digits),
+       `""`, `"blue"` and `"#12345"`; and the participant fallback;
+     - `avatar_id`: a group, no participants, an empty key, `is_me` only, a hidden
+       participant, and the normal case.
    - Verify: `nix develop -c cargo test phone::` (count > 0), clippy and fmt.
 
-2. **Probe: which action works** *(Claude, with the owner)*
-   - Temporary, never committed: in `Sync`'s `Event::Ready` arm, on the first ready only,
-     send `Command::Avatars` for up to 10 avatar_ids from `conversations`. Then do the
-     same with `AVATAR_BY_CONTACT` flipped, as a second build. Log at info level the
-     number of ids asked, of non-empty images, and of errors.
-   - Run it with a script file (`scratchpad/probe-avatars.sh`):
-     1. stop the `gmessages-tui` user unit;
-     2. run the debug binary in the foreground with `serve` until `ready`, plus 10 s;
-     3. stop it;
-     4. start the unit again.
-   - Read only the count lines from `phone.log` and stdout.
-   - Revert the probe with `git checkout -- src/`. Set `AVATAR_BY_CONTACT` from the
-     result, and record the result in this plan under "Probe result", in the step 3
-     commit.
-   - If both counts are zero, stop and ask the owner before step 3.
-   - Verify: the counts are recorded, and `git status` shows only the plan edit.
-
-3. **Store** (`src/store.rs`). *coder: coder*
+3. **Store** (`src/store.rs`, plus the literal at `src/proto.rs:511`). *coder: coder*
    - **Migration:** set `SCHEMA` to 6. Add a `version < 6` block in a transaction, the
-     same way as v5 (`:120`): `ALTER TABLE conversations ADD COLUMN colour TEXT;` and
-     `ALTER TABLE conversations ADD COLUMN avatar_id TEXT;`.
-   - **Saving:** `save_conversations` (the `INSERT … ON CONFLICT` at `:184`) writes both
-     columns. On conflict, it keeps the stored value when the new one is `NULL`.
+     same way as v5 (`:120`), adding the nullable columns `colour TEXT` and
+     `avatar_id TEXT`.
+   - **Saving:** `save_conversations` (`:184`) writes both columns, with the merge rule
+     from "Data".
    - **Reading:** `store::Conversation` (`:33`) gains `colour: String` and
-     `avatar_id: Option<String>`. `conversations_with` (`:142`) reads them, with
-     `colour` defaulting to `""`.
-   - **Tests:**
-     - migrating v5 to v6 keeps the conversations;
-     - a save and load round-trips both fields;
-     - a later save with `avatar_id: None` keeps the stored id.
-     - The test at `:487`, which sets user_version 6 as a "newer" version, must use 7.
+     `avatar_id: Option<String>`. Both readers, `conversations_with` (`:142`) and
+     `conversations_hidden` (`:268`), select them, with `colour` defaulting to `""`.
+   - **Fix existing tests:**
+     - the assertion at `:479` expects 6;
+     - the "newer version" test at `:487` sets 7.
+   - **New tests:**
+     - v5 to v6 keeps the conversations;
+     - both fields round-trip;
+     - a later 1:1 save with `avatar_id: None` and `colour: ""` keeps both;
+     - a group save clears `avatar_id`.
    - Verify: `nix develop -c cargo test store::` (count > 0), clippy and fmt.
 
 4. **Sync, protocol and serve** (`src/sync.rs`, `src/proto.rs`, `src/serve.rs`,
    `Cargo.toml`, `Cargo.lock`). *coder: codex*
    - **`proto.rs`:**
      - `Conversation` (`:137`) gains `color: String` and `avatar: Option<String>`.
-     - `from_phone` and `from_store` take a third argument,
-       `avatar: Option<String>`, and set `color` from `colour`.
+     - `from_phone` and `from_store` take a second argument, `(color: String,
+       avatar: Option<String>)`.
      - Add `AvatarsEvent { items: BTreeMap<String, String> }`.
      - The no-secrets test fills the new fields.
    - **`sync.rs`:**
-     - Add the state listed in "Data" above, plus a `u64` token counter and
-       `avatar_dir: PathBuf`. `Sync::new` takes `avatar_dir`.
-     - `fn enqueue(&mut self, id)`, and `fn pump(&mut self)`, which sends one batch when
-       the conditions in "Fetching" hold.
-     - `conversations()` becomes `&mut self`: it enqueues each item's avatar_id, calls
-       `pump`, and fills `avatar`.
-     - `conversation()` fills `avatar`. It enqueues only when `ready`.
-     - `Event::Ready` sets `ready` and calls `pump` after its outputs.
-     - `Unpaired`, `Expired`, `Fatal` and `Login`:
-       - clear `ready`;
-       - bump the token, so `in_flight` becomes `None`;
-       - only on `Unpaired`, empty `avatars`, `queue`, `tried` and `failed_once`, and
-         clear `avatar_dir`.
-     - `Event::Avatars`:
-       - drop it if the token doesn't match;
-       - apply the image checks and write the files;
-       - update the maps;
-       - emit one `avatars` event for every stored conversation (`store.conversation_list()`)
-         whose `avatar_id` got a path;
-       - call `pump`.
-     - Logging has counts only.
+     - Add the state from "Data", and `Sync::new(store, commands, avatar_dir)`, which
+       loads `meta` from the store.
+     - Implement "Fetching" exactly as written: `enqueue`, `pump`, the
+       `Event::Conversation` queueing, losing `ready`, `Paired`/`Unpaired`, results,
+       image checks and files.
+     - `conversations()` becomes `&mut self`.
+     - Every `from_phone`/`from_store` call site passes `color` and `avatar`. That
+       includes `conversation()`, the `Gone` path (`:382`) and the tests.
    - **`serve.rs`:**
-     - Create `runtime/avatars` (0700) next to `media` (`:115`), and clear it at start and
-       at stop (`:125`, `clear_media` at `:877`, reused).
-     - Pass it to `Sync::new`.
+     - Create `runtime/avatars` (0700) next to `media` (`:115`).
+     - Clear it at start and stop with `clear_media` (`:877`, reused at `:116` and
+       `:125`).
+     - Thread the path through `serve_bound` and `Daemon` to the delayed `Sync::new`
+       (`:270`).
      - The `"conversations"` arm (`:661`) uses `as_mut()`.
-   - **`Cargo.toml`:** `imagesize` (latest 0.x), added with `cargo add`.
-   - **Tests** in `sync.rs`, using the existing fixtures:
-     - colour reaches `color`;
-     - queueing skips duplicates, `tried` ids and `avatars` ids;
-     - batches hold at most 50 ids, with one in flight;
-     - a bad magic, a 300 KiB file, and a 40-byte PNG whose header says 20000×20000 are
-       all rejected;
-     - an unrequested id is ignored;
+   - **Tests** in `sync.rs`:
+     - color and avatar reach every outgoing conversation:
+       - a `conversations` reply;
+       - a live `conversation` event;
+       - a bulk `Ready`;
+       - `Gone`;
+       - a partial update that keeps a known colour and picture.
+     - queueing skips duplicates, ids in flight, `tried` and `avatars`, and a second
+       `partial: false` Ready queues nothing;
+     - one batch in flight, at most 50 ids, a fresh token per batch;
+     - a bad magic, a 300 KiB file, and a 40-byte PNG whose header says 20000×20000 all
+       go to `tried`;
+     - a missing id goes to `tried`; an unrequested id is ignored;
      - a failed batch requeues once, then the ids go to `tried`;
-     - a late result after `Unpaired` is dropped;
-     - files are 0600 and named by their content;
-     - a `conversations` reply after the `avatars` event carries the path;
-     - `Unpaired` empties the directory.
+     - after `Connected`, the ids in flight are requeued and the late result is dropped;
+     - after `Paired`, `Unpaired` and a second pairing, everything is reset and the
+       directory is empty;
+     - files are 0600 and named by their content, and the same image twice gives one
+       file;
+     - at most one `avatars` event per batch, and none when empty.
    - Verify: `nix develop -c cargo test` (all), clippy and fmt.
 
 5. **Plugin** (`plugin/Avatar.qml` new, `plugin/Client.qml`,
    `plugin/ConversationList.qml`, `plugin/Thread.qml`, `plugin/App.qml`).
    *coder: coder*
-   - **`Client.qml`:** `signal avatarsArrived(var items)`, and a `case "avatars":` in the
+   - **`Client.qml`:** `signal avatarsArrived(var items)`, and `case "avatars":` in the
      event switch (`:101`).
-   - **`Avatar.qml`:** as in "Plugin" above. The person icon is the same glyph font the
-     bar widget uses.
+   - **`Avatar.qml`:** as in "Plugin". The person icon uses the glyph font
+     `BarWidget.qml` uses.
    - **`ConversationList.qml`:**
-     - add the `avatars` map;
-     - `upsertConversation` (`:85`) and the page merge (`:64`–`:83`) copy `item.avatar`
-       into the map when it isn't null;
-     - `onAvatarsArrived` merges in one assignment;
-     - the delegate (`:340`) puts an `Avatar` before the unread dot, at `size: Style.space(32)`;
-     - `conversationSelected` gains `avatar`, `color` and `group` arguments.
-   - **`App.qml`:** forwards them to `Thread`.
-   - **`Thread.qml`:** `property string conversationAvatar`, `conversationColor` and
-     `conversationGroup`, and an `Avatar` at `size: Style.space(40)` in the header
-     (`:180`).
+     - the `avatars` map and `selectedItem`;
+     - the page merge (`:64`–`:83`) and `upsertConversation` (`:85`) write item paths
+       into the map and keep a known `color`;
+     - `onAvatarsArrived`;
+     - the map is reset on the `login` state;
+     - an `Avatar` in the delegate (`:340`) before the unread dot, at
+       `size: Style.space(32)`.
+   - **`Thread.qml`:**
+     - `property string conversationAvatar`, `property string conversationColor` and
+       `property bool conversationGroup: false`;
+     - an `Avatar` at `size: Style.space(40)` in the header (`:180`);
+     - the header's height becomes
+       `Math.max(root.theme.ctl + root.theme.padY, Style.space(40) + root.theme.padY)`.
+   - **`App.qml`:** the reactive bindings from "Plugin", on the `Thread` at `:238`.
    - Verify:
      - qmllint parse-only on the five files, with the flags `nix/plugin.nix` uses;
-     - *(Claude)* `nix build .#plugin`.
+     - *(Claude)* `nix build .#plugin`;
+     - *(Claude)* qmllint with `-I` on Quickshell's qml dir, on copies with the
+       `qmllint disable` lines stripped. Every new warning is read; the known `qs.*`
+       noise is ignored.
 
 6. **Build, deploy, check** *(Claude)*
    - `nix flake check`, then push.
-   - In `~/.config/nixos-gmessages`: run `nix flake lock --update-input gmessages`, build
-     p620 and razer, and check that both closure diffs touch only the gmessages paths.
-   - Post on the agent bus, then switch p620 and razer. The owner asked for both hosts
-     on 2026-11-12.
-   - Checks:
+   - **Backup:** before the first v6 binary runs on a host, with the unit stopped (script
+     file), copy `~/.local/share/gmessages-tui/messages.db` to
+     `messages.db.v5-<date>` (0600).
+   - In `~/.config/nixos-gmessages`:
+     - `nix flake lock --update-input gmessages`;
+     - build p620 and razer;
+     - check that both closure diffs touch only the gmessages paths;
+     - post on the agent bus;
+     - switch p620, then razer. The owner asked for both on 2026-11-12.
+   - **Checks, with the owner:**
      1. The list shows pictures for contacts that have one on the phone, and initials
         circles for the others and for groups.
-     2. The thread header shows the same picture.
-     3. `ls -l $XDG_RUNTIME_DIR/gmessages-tui/avatars`: 0700, with files at 0600.
-     4. After the unit stops and starts again (script file), the pictures come back.
-     5. `phone.log` has no participant ids.
-     6. There are no QML errors in the journal.
+     2. The thread header shows the same picture, including one opened before its
+        picture arrived, and one opened from a notification.
+     3. Scrolling the full list after a start of the unit leaves no row without its
+        picture. This covers a picture arriving between pages.
+     4. `ls -l $XDG_RUNTIME_DIR/gmessages-tui/avatars`: 0700, with files at 0600.
+     5. After the unit stops and starts again (script file), the pictures come back.
+     6. `phone.log` has counts only, with no ids.
+     7. The journal shows no QML errors.
+
+## Probe result
+
+*(Filled in by step 1.)*
 
 ## Tests
 
 | When | Command | Expected |
 |------|---------|----------|
-| Steps 1, 3, 4 | that step's verify, plus clippy and fmt | green; filtered counts > 0 |
-| Step 5 *(Claude)* | `nix build .#plugin` | builds, qmllint parse passes |
+| Step 1 *(Claude)* | `scratchpad/probe-avatars.sh` | counts recorded; tree clean |
+| Steps 2, 3, 4 | that step's verify, plus clippy and fmt | green; filtered counts > 0 |
+| Step 5 *(Claude)* | `nix build .#plugin` and qmllint with `-I` | builds; no new warnings |
 | Step 6 *(Claude)* | `nix flake check` | all pass |
-| Step 6 | checks 1–6 | confirmed with the owner |
-| Review | Opus review with only this plan path and `git diff 9ed1289..HEAD`; then Codex and agy, read-only | findings reported; none approves anything |
+| Step 6 | checks 1–7 | confirmed with the owner |
+| Review | Opus review with only this plan path and `git diff <plan approval>..HEAD`; then Codex and agy, read-only | findings reported; none approves anything |
 
 ## Rollback
 
-- Each step is its own commit on `feat/nixos-flake`: revert it.
-- Migration v6 only adds nullable columns. A v5 binary refuses a v6 store ("store from a
-  newer version"), so rolling the binary back also needs the two columns dropped, or the
-  store restored. The plan doesn't automate that: ask the owner.
-- On the hosts, switch to the previous generation. `runtime/avatars` is tmpfs and goes
-  away at logout.
+- In this repo, each step is its own commit on `feat/nixos-flake`: revert it.
+- On a host, v6 can't be undone in place. A v5 binary refuses a v6 store ("store from a
+  newer version", `src/store.rs:70`), and dropping the columns still leaves
+  `user_version` at 6. To roll back:
+  1. stop the unit;
+  2. restore `messages.db.v5-<date>` from step 6, which loses messages that arrived
+     since, though the phone sends recent history again;
+  3. switch the host to the previous generation;
+  4. start the unit.
+- `runtime/avatars` is on tmpfs and goes away at logout.
