@@ -20,6 +20,7 @@ Item {
     signal messageArrived(string conv, var msg, bool notify)
     signal missed(int count)
     signal typing(string conversation, string name, bool started)
+    signal avatarsArrived(var items)
     // After every handshake: state is re-read, so views reload what they missed.
     signal resynced()
 
@@ -129,6 +130,9 @@ Item {
             break;
         case "unread":
             root.unread = Number(d.count) || 0;
+            break;
+        case "avatars":
+            root.avatarsArrived(d.items || ({}));
             break;
         case "typing":
             root.typing(String(d.conversation || ""), String(d.name || ""), d.started === true);

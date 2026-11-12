@@ -392,6 +392,10 @@ path}`, which section 6 replaced with one `avatars {items}` event per batch.
   `#[allow(clippy::large_enum_variant)]` with a reason: events go one at a time through
   a channel, so boxing gains nothing.
 
+- Step 5: the shell's `qs.Commons` `Color` has no `surface`. Its colours are
+  `foreground`, `background`, `accent`, `urgent` and `muted`. The initials circle
+  falls back to `Commons.Color.muted`. Changed by the lead.
+
 ## Probe result
 
 Run on p620 on 2026-11-12 against the owner's paired phone, with the unit stopped. The

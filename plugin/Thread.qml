@@ -13,6 +13,9 @@ Item {
     required property var theme
     property string conversationId: ""
     property string conversationName: ""
+    property string conversationAvatar: ""
+    property string conversationColor: ""
+    property bool conversationGroup: false
     property bool compact: false
     // Set by App: the window is visible and active, so arriving messages are being read.
     property bool focused: false
@@ -181,7 +184,7 @@ Item {
         Rectangle {
             visible: root.conversationId !== ""
             Layout.fillWidth: true
-            Layout.preferredHeight: root.theme.ctl + root.theme.padY
+            Layout.preferredHeight: Math.max(root.theme.ctl + root.theme.padY, Style.space(40) + root.theme.padY)
             color: "transparent"
 
             RowLayout {
@@ -211,6 +214,16 @@ Item {
                         cursorShape: Qt.PointingHandCursor
                         onClicked: root.backRequested()
                     }
+                }
+
+                Avatar {
+                    Layout.alignment: Qt.AlignVCenter
+                    theme: root.theme
+                    size: Style.space(40)
+                    path: root.conversationAvatar
+                    color: root.conversationColor
+                    name: root.conversationName
+                    group: root.conversationGroup
                 }
 
                 ColumnLayout {

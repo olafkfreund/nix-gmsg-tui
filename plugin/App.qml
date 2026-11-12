@@ -246,6 +246,9 @@ FloatingWindow {
                 focused: root.visible && root.windowActive
                 conversationId: root.activeConversation
                 conversationName: root.activeConversationName
+                conversationAvatar: convList.avatars[root.activeConversation] || ""
+                conversationColor: convList.selectedItem ? String(convList.selectedItem.color || "") : ""
+                conversationGroup: convList.selectedItem ? convList.selectedItem.group === true : false
 
                 onBackRequested: {
                     root.activeConversation = "";

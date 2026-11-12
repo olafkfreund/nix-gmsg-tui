@@ -20,6 +20,14 @@ Item {
     signal conversationSelected(string id, string name)
 
     property var allItems: []
+    // Conversation id to picture path; replaced whole on each change.
+    property var avatars: ({})
+    readonly property var selectedItem: {
+        for (var i = 0; i < root.allItems.length; i++) {
+            if (root.allItems[i].id === root.selectedId) return root.allItems[i];
+        }
+        return null;
+    }
     property int totalCount: 0
     property bool loading: false
 
@@ -55,6 +63,19 @@ Item {
         }
     }
 
+    function noteAvatars(items) {
+        var next = Object.assign({}, root.avatars);
+        var changed = false;
+        for (var i = 0; i < items.length; i++) {
+            var c = items[i];
+            if (c && c.id && c.avatar && next[c.id] !== c.avatar) {
+                next[c.id] = c.avatar;
+                changed = true;
+            }
+        }
+        if (changed) root.avatars = next;
+    }
+
     function reload() {
         if (!root.client.connected || root.client.state !== "ready") return;
         root.loading = true;
@@ -70,6 +91,7 @@ Item {
             var items = Array.isArray(r.data.items) ? r.data.items : [];
             var total = Number(r.data.total) || 0;
             root.totalCount = total;
+            root.noteAvatars(items);
             var merged = acc.concat(items);
             merged.sort(function(a, b) { return (Number(b.last_ms) || 0) - (Number(a.last_ms) || 0); });
             root.allItems = merged;
@@ -84,6 +106,7 @@ Item {
 
     function upsertConversation(c) {
         if (!c || !c.id) return;
+        root.noteAvatars([c]);
         var next = [];
         var found = false;
         for (var i = 0; i < root.allItems.length; i++) {
@@ -92,7 +115,10 @@ Item {
                 found = true;
                 if (!c.hidden && (c.folder === "inbox" || !c.folder)) {
                     // A conversation event may come without a snippet; keep the last one known.
-                    next.push(c.snippet ? c : Object.assign({}, c, { snippet: cur.snippet || "" }));
+                    var keep = {};
+                    if (!c.snippet) keep.snippet = cur.snippet || "";
+                    if (!c.color) keep.color = cur.color || "";
+                    next.push(Object.assign({}, c, keep));
                 }
             } else {
                 next.push(cur);
@@ -221,6 +247,7 @@ Item {
     Connections {
         target: root.client
         function onStateChanged() {
+            if (root.client.state === "login") root.avatars = ({});
             if (root.client.state === "ready") {
                 root.reload();
             }
@@ -232,6 +259,11 @@ Item {
         }
         function onConversationChanged(c) {
             root.upsertConversation(c);
+        }
+        function onAvatarsArrived(items) {
+            var next = Object.assign({}, root.avatars);
+            for (var id in items) next[id] = items[id];
+            root.avatars = next;
         }
         function onMessageArrived(conv, msg, notify) {
             root.noteMessage(conv, msg, notify);
@@ -355,6 +387,16 @@ Item {
                         anchors.leftMargin: root.theme.padX
                         anchors.rightMargin: root.theme.padX
                         spacing: root.theme.gap
+
+                        Avatar {
+                            Layout.alignment: Qt.AlignVCenter
+                            theme: root.theme
+                            size: Style.space(32)
+                            path: root.avatars[rowDelegate.modelData.id] || ""
+                            color: String(rowDelegate.modelData.color || "")
+                            name: String(rowDelegate.modelData.name || "")
+                            group: rowDelegate.modelData.group === true
+                        }
 
                         // Unread dot
                         Rectangle {
