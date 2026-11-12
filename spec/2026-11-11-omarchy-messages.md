@@ -1,6 +1,6 @@
 ---
-status: draft
-amendment: contact pictures in stage b (2026-11-12), awaiting approval
+status: approved
+amendment: contact pictures in stage b (2026-11-12), approved 2026-11-12
 issue: none (issues are disabled on the fork)
 intent: intent/2026-11-11-omarchy-messages.md
 ---
