@@ -431,6 +431,36 @@ impl Store {
         Ok((!attachments.is_empty()).then_some(attachments))
     }
 
+    /// The downloaded attachment at `position` of message `id`.
+    pub fn attachment(&self, id: &str, position: u32) -> rusqlite::Result<Option<Attachment>> {
+        self.conn
+            .query_row(
+                "SELECT content_type, file_name, width, height, bytes FROM attachments
+                 WHERE message = ?1 AND position = ?2",
+                params![id, position],
+                |row| {
+                    Ok(Attachment {
+                        content_type: row.get(0)?,
+                        file_name: row.get(1)?,
+                        width: row.get(2)?,
+                        height: row.get(3)?,
+                        bytes: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+    }
+
+    /// Records the downloaded attachment at `position` of message `id`.
+    pub fn save_attachment(&self, id: &str, position: u32, a: &Attachment) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO attachments (message, position, content_type, file_name, width, height, bytes)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![id, position, a.content_type, a.file_name, a.width, a.height, a.bytes],
+        )?;
+        Ok(())
+    }
+
     /// Records the downloaded attachments of message `id`.
     pub fn save_attachments(&self, id: &str, attachments: &[Attachment]) -> rusqlite::Result<()> {
         let tx = self.conn.unchecked_transaction()?;
@@ -734,8 +764,15 @@ mod tests {
             store
                 .save_attachments("a", std::slice::from_ref(&image))
                 .unwrap();
-            assert_eq!(store.attachments("a").unwrap(), Some(vec![image]));
+            assert_eq!(store.attachments("a").unwrap(), Some(vec![image.clone()]));
             assert_eq!(store.attachments("b").unwrap(), None);
+            let second = Attachment {
+                bytes: vec![9],
+                ..image.clone()
+            };
+            store.save_attachment("c", 1, &second).unwrap();
+            assert_eq!(store.attachment("c", 1).unwrap(), Some(second));
+            assert_eq!(store.attachment("c", 0).unwrap(), None);
         }
 
         let bytes = std::fs::read(&path).unwrap();

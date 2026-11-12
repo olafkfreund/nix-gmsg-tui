@@ -319,6 +319,8 @@ pub struct Attachment {
     pub data: Vec<u8>,
     pub width: Option<u32>,
     pub height: Option<u32>,
+    /// False when this is the preview or the inline thumbnail, not the medium itself.
+    pub full: bool,
 }
 
 /// One person's emoji on a message.
@@ -1476,6 +1478,17 @@ async fn send(
     })
 }
 
+/// The largest medium downloaded, declared or real.
+const MEDIA_MAX: usize = 100 * 1024 * 1024;
+
+/// Fails "too large" if the declared or the real size is over `MEDIA_MAX`.
+fn check_size(declared: i64, actual: usize) -> Result<(), String> {
+    if actual > MEDIA_MAX || usize::try_from(declared).is_ok_and(|d| d > MEDIA_MAX) {
+        return Err("too large".to_string());
+    }
+    Ok(())
+}
+
 /// Downloads `media`, of `message`; those the phone has sent only as previews are asked in
 /// full first.
 async fn download(
@@ -1493,11 +1506,13 @@ async fn download(
             serde_json::from_value(medium).map_err(|e| format!("bad medium stored: {e}"))?;
         let medium = full(state, &client, message, medium).await;
         // The best there is: the medium, its preview, the small preview in the message.
+        check_size(medium.size, 0)?;
         let (id, key) = if medium.media_id.is_empty() {
             (&medium.thumb_id, &medium.thumb_key)
         } else {
             (&medium.media_id, &medium.key)
         };
+        let full = !medium.media_id.is_empty();
         let data = if !id.is_empty() {
             client
                 .download_media(id, key)
@@ -1508,12 +1523,14 @@ async fn download(
         } else {
             return Err("not downloaded by the phone yet".to_string());
         };
+        check_size(0, data.len())?;
         attachments.push(Attachment {
             content_type: medium.mime,
             name: Some(medium.name).filter(|n| !n.is_empty()),
             data,
             width: u32::try_from(medium.width).ok().filter(|&w| w > 0),
             height: u32::try_from(medium.height).ok().filter(|&h| h > 0),
+            full,
         });
     }
     Ok(attachments)
@@ -1880,6 +1897,15 @@ mod tests {
     use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 
     use super::*;
+
+    #[test]
+    fn check_size_caps_declared_and_real() {
+        assert!(check_size(10, 10).is_ok());
+        assert!(check_size(0, MEDIA_MAX).is_ok());
+        assert!(check_size(MEDIA_MAX as i64 + 1, 0).is_err());
+        assert_eq!(check_size(0, MEDIA_MAX + 1).unwrap_err(), "too large");
+        assert!(check_size(-1, 0).is_ok());
+    }
 
     fn one_to_one() -> gm::Conversation {
         gm::Conversation {

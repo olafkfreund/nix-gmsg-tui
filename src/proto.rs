@@ -162,6 +162,15 @@ pub struct Message {
     pub failed: bool,
     pub pending: bool,
     pub attachments: Vec<Attachment>,
+    pub reactions: Vec<Reaction>,
+}
+
+/// One emoji on a message: how many people sent it, and whether I did.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Reaction {
+    pub emoji: String,
+    pub count: u32,
+    pub mine: bool,
 }
 
 /// `text` cut to at most 80 bytes, on a char boundary.
@@ -228,6 +237,20 @@ impl Message {
                 size: d.size,
             })
             .collect();
+        let mut reactions: Vec<Reaction> = Vec::new();
+        for r in &m.reactions {
+            match reactions.iter_mut().find(|x| x.emoji == r.emoji) {
+                Some(x) => {
+                    x.count += 1;
+                    x.mine |= r.mine;
+                }
+                None => reactions.push(Reaction {
+                    emoji: r.emoji.clone(),
+                    count: 1,
+                    mine: r.mine,
+                }),
+            }
+        }
         Self {
             id: m.id.clone(),
             conversation: conversation.to_owned(),
@@ -240,6 +263,7 @@ impl Message {
             failed: m.failed,
             pending,
             attachments,
+            reactions,
         }
     }
 }
@@ -302,6 +326,46 @@ pub struct SendParams {
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[allow(dead_code, reason = "used in plan b2 step 2")]
+pub struct ReactParams {
+    pub conversation: String,
+    pub message: String,
+    pub emoji: String,
+    pub op: ReactOp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReactOp {
+    Add,
+    Remove,
+    Replace,
+}
+
+impl From<ReactOp> for gmessages_proto::ReactionOp {
+    fn from(op: ReactOp) -> Self {
+        match op {
+            ReactOp::Add => Self::Add,
+            ReactOp::Remove => Self::Remove,
+            ReactOp::Replace => Self::Replace,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[allow(dead_code, reason = "used in plan b2 step 2")]
+pub struct MediaParams {
+    pub message: String,
+    pub index: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[allow(dead_code, reason = "used in plan b2 step 2")]
+pub struct MediaData {
+    pub path: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -488,10 +552,37 @@ mod tests {
             text: "hello".into(),
             quote: Some("m0".into()),
             media: vec![medium(1), medium(2)],
-            reactions: vec![],
+            reactions: vec![
+                phone::Reaction {
+                    emoji: "👍".into(),
+                    sender_id: "SECRET-REACTOR-1".into(),
+                    mine: false,
+                },
+                phone::Reaction {
+                    emoji: "❤️".into(),
+                    sender_id: "SECRET-REACTOR-2".into(),
+                    mine: false,
+                },
+                phone::Reaction {
+                    emoji: "👍".into(),
+                    sender_id: "SECRET-REACTOR-3".into(),
+                    mine: true,
+                },
+            ],
             deleted: false,
             failed: false,
         }
+    }
+
+    #[test]
+    fn reactions_are_aggregated_per_emoji() {
+        let dto = Message::from_phone("c1", &phone_message(), false);
+        let want = |emoji: &str, count, mine| Reaction {
+            emoji: emoji.into(),
+            count,
+            mine,
+        };
+        assert_eq!(dto.reactions, [want("👍", 2, true), want("❤️", 1, false)]);
     }
 
     #[test]
