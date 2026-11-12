@@ -248,58 +248,133 @@ The same file shape as `nixarchy.meetingai`:
 ### 6. Contact pictures (stage b)
 
 Added on 2026-11-12, after the owner saw the stage a list on p620 without pictures.
+Revised after Codex and agy review.
 
 **What the user sees:**
 - Each row of the list has a round picture at the start, and the thread header has a
   larger one.
 - A conversation with no picture shows a circle in the phone's colour for it, with the
-  initials of its name.
+  initials of its name. A name that is a number, or has no letters, shows a person icon
+  instead.
 - A group shows its initials circle. Group pictures (`group_avatar_url`) are out of scope.
 
-**Backend:**
-- **Which picture:** a 1:1 conversation uses its single participant that isn't us
-  (`is_me == false`, `visible`). The phone layer already has
-  `participant_thumbnails(ids)` (action 37, `gmessages-proto/src/client.rs:584`). The
-  daemon doesn't call it today.
-- **When it's fetched:**
-  - after each `conversations` reply and each `conversation` event, for participants
-    not yet tried in this run;
-  - in batches of up to 50 ids, at most one batch in flight;
-  - an id is tried once per daemon run. A participant with no picture, or a failed
-    call, isn't asked again until the unit starts again.
-  - Fetching only happens in `ready`. A failure is logged with a count, never the ids,
-    and never changes the state.
-- **Where it's kept:** `runtime/avatars/<sha256(participant id)>`, mode 0600, the same as
-  decrypted media.
-  - It's written atomically: written beside the target, then renamed.
-  - The runtime dir is tmpfs, mode 0700, and cleared on stop. Pictures are never written
-    to the persistent cache, because the store they come from is encrypted.
-  - Each start fetches them again, which costs one batch per 50 contacts.
-  - A response that isn't JPEG, PNG or WebP (checked by its magic bytes), or that is
-    over 512 KiB, is dropped.
-- **Protocol:**
-  - Conversation items gain `color` (the phone's hex colour, or `""`) and `avatar` (an
-    absolute path, or `null`).
-  - When a picture lands, the daemon broadcasts `avatar {conversation, path}` once for
-    every conversation that uses that participant.
-  - `avatar` is additive, so the protocol stays at 1, and stage a clients ignore it.
-  - No secret fields are added, and the no-secrets test covers the new fields.
+**Which picture:**
+- The phone layer has two calls with the same request shape:
+  - `participant_thumbnails` (action 37, `gmessages-proto/src/client.rs:584`), keyed
+    by `Participant.id`;
+  - `contact_thumbnails` (action 29), keyed by `Participant.contact_id`. `types.rs:683`
+    documents that id as "for avatars".
+- The plan's first step is a probe on the paired phone that decides between them, with
+  the unit stopped. The result is recorded in the plan. If both answer, action 37 wins,
+  because it also covers numbers that aren't in the address book.
+- Only 1:1 conversations get a picture:
+  - the conversation must not be a group;
+  - the participant is the one `other_participant()` returns (`types.rs:795`);
+  - its id must not be empty.
+
+**Data:**
+- `phone::Conversation` (`src/phone.rs:207`) gains two fields:
+  - `colour`: normalised in Rust to `#rrggbb`, or `""` when the phone's value isn't
+    six hex digits, with or without `#`;
+  - `avatar_id`: the id chosen above, or `None`.
+- The store's `conversations` table gains the nullable text columns `colour` and
+  `avatar_id`, in migration v6. That way, replies served from the store while offline
+  still have them. Image bytes never go into SQLite.
+- `Sync` keeps, in memory:
+  - `avatars`: a map from `avatar_id` to file path;
+  - `queue`: a deduplicated queue of ids to fetch;
+  - `tried`: a set of ids already fetched or found to have no picture.
+- Every conversation the daemon sends gets `avatar` from that map, whether it comes
+  from `from_phone`, `from_store` or the `conversations` reply. This way a later reply
+  or event never loses a picture that has already arrived.
+
+**Fetching:**
+- **What gets queued:**
+  - the `avatar_id` of each item in a `conversations` reply, which is the list the
+    window actually shows;
+  - the `avatar_id` of each live `conversation` event while the state is `ready`.
+  - The bulk `conversation` events of `Event::Ready` don't queue anything; the list's
+    own reload covers them. Ids already in `tried` or `avatars` are skipped.
+- **Batches:**
+  - A batch is sent when the state is `ready`, no batch is in flight, and the queue
+    isn't empty. That happens on entering `ready`, on queueing, and when a batch
+    finishes, with at least 2 s between batches.
+  - A batch holds up to 50 ids.
+  - It runs with `spawn_local`, off the receive loop, with a 30 s timeout, and the
+    result comes back as a message like `Incoming::Key`.
+- **Results:**
+  - A returned entry whose id wasn't requested is ignored.
+  - A missing entry, or an empty `image`, means "no picture": the id goes into `tried`.
+  - When a batch fails, its ids go back into the queue once. On a second failure they
+    go into `tried`.
+  - The log line has a count, never ids.
+  - A result that arrives after the session has changed (unpair, or pairing again) is
+    dropped, using a session counter.
+- **Image checks:** an image is kept only when:
+  - its magic bytes are JPEG, PNG or WebP;
+  - it is at most 256 KiB;
+  - its header dimensions are at most 1024 px per side. They are read from the header
+    with the `imagesize` crate (small, no dependencies), so the image isn't decoded.
+- **Files:** `runtime/avatars/<sha256(image)>.<jpg|png|webp>`:
+  - The directory is mode 0700. Each file is written to a 0600 temp file beside it,
+    then renamed.
+  - The name comes from the image's content, so a changed photo gets a new URL and
+    Qt's image cache never shows an old one.
+  - The daemon builds each path itself; nothing from the phone becomes a path.
+- **Lifecycle:** `runtime/avatars` is cleared along with `runtime/media`:
+  - at start, which covers a crash;
+  - at stop;
+  - on `unpair` and `uninstall`;
+  - on `Event::Unpaired`, which also empties `avatars`, `queue` and `tried`.
+
+**Protocol:**
+- Conversation items gain `color` (`#rrggbb` or `""`) and `avatar` (an absolute path, or
+  `null`).
+- A new event `avatars {items: {<conversation id>: <path>}}` is sent once per batch.
+  It lists every conversation whose `avatar_id` got a picture.
+- These additions don't change the protocol version (still 1), and stage a clients
+  ignore them.
+- No secret fields are added, and the no-secrets test covers the new fields.
 
 **Plugin:**
-- **`Avatar.qml`:** an `Image` from `file://` + path, clipped to a circle with
-  Quickshell's `ClippingRectangle`. With no path, or when the image fails to load, it
-  shows the initials circle instead.
-- **Size and colour:** 32 px in the list and 40 px in the thread header, at the theme
-  scale. Initials use the theme font on `color`, or on the theme's surface colour when
-  `color` is empty.
-- **Updates:** `ConversationList` and `Thread` set the path from the `avatar` event. The
-  image reloads when the path changes.
+- **`Avatar.qml`** takes `path`, `color`, `name`, `group` and `size`:
+  - It shows an `Image` from `file://` + path, clipped to a circle with Quickshell's
+    `ClippingRectangle`, with `asynchronous: true` and `sourceSize` set to the shown size.
+  - With no path, or when the image fails to load, it shows the initials circle. Initials
+    are the first letter of the first two words, split on code points. The text colour is
+    chosen for contrast with `color`, which falls back to the theme's surface colour.
+- **Sizes:** 32 px in the list and 40 px in the thread header, at the theme scale.
+- **`ConversationList`** keeps an `avatars` map, from conversation id to path, apart from
+  the rows:
+  - Items and the `avatars` event both write to it, and the delegate reads it.
+  - A row that is replaced, or a page that arrives later, keeps its picture.
+  - One `avatars` event changes the map once.
+- **`Thread`:** `App.qml` passes the selected conversation's `avatar`, `color`, `name` and
+  `group` to the header. This includes a thread opened from a notification.
+
+**Tests:**
+- Unit tests:
+  - colour normalisation;
+  - the `avatar_id` choice: a group, an empty id, `is_me`;
+  - the image checks: a bad magic, an oversized file, a tiny file whose header claims
+    20000×20000;
+  - requeue once, then `tried`;
+  - a late result after a session change is dropped;
+  - every `conversations` reply and `conversation` event carries a known avatar;
+  - the directory is cleared on `Unpaired`.
+- The no-secrets test covers the new fields.
+- QML: a picture that arrives between two pages of the list is still there once the
+  last page has loaded.
 
 ## Alternatives rejected
 
-- **Contact pictures in `~/.cache` or in the store:** a persistent plaintext cache would
-  leak what the encrypted store protects; a store table means a migration for data the
-  phone serves again in one call per 50 contacts.
+- **Contact pictures in `~/.cache` or as blobs in the store:** a persistent plaintext
+  cache would leak what the encrypted store protects; blobs would grow the store for data
+  the phone serves again in one call per 50 contacts. Only the two short ids go in.
+- **One `avatar` event per conversation, or reusing `conversation`:** up to 50 list
+  rebuilds per batch; one `avatars` event per batch is one.
+- **Pictures keyed by participant id:** a changed photo keeps its URL, and Qt's image
+  cache shows the old one. Content-addressed names avoid it.
 - **Fetching pictures in QML:** the phone layer and its session live in the daemon only.
 - **stdin/stdout child of `Service.qml` (omamail):** the bar and the window would go
   through one instance, and a plugin reload would drop the Google session.
@@ -317,9 +392,11 @@ Added on 2026-11-12, after the owner saw the stage a list on p620 without pictur
 
 ## Risks
 
-- Contact pictures: action 37's request shape is from the reverse-engineered client and
-  unverified here; if the phone rejects it, the list keeps the initials circles and the
-  daemon logs the failure once per batch.
+- Contact pictures: neither action 29 nor 37 has been tried against this phone. The
+  plan's probe decides before any code. If both fail, the feature ships as initials
+  circles only, and the owner is told.
+- Contact pictures: a new dependency, `imagesize`, header-only parsing with no
+  dependencies of its own.
 
 - **Google refuses the embedded window:** the manual localhost page is the fallback.
   Checked by hand.
