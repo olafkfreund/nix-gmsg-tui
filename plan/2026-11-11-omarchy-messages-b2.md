@@ -171,8 +171,8 @@ and no ids:
   update, which arrives as a `message` event like any other update, stored and quiet
   (`sync.rs:294-347`).
 
-**State that outlives delegates:** `mergeMessages` replaces the message array on every
-event (`Thread.qml:98`), so the busy, error and "Saved to" state lives in maps on the
+**State that outlives delegates:** `mergeMessages` (`Thread.qml:73`) replaces the message array on every
+event, so the busy, error and "Saved to" state lives in maps on the
 Thread root, keyed by `message + ":" + index` or by message id, not in delegates.
 
 **Out of b2** (named, not built):
