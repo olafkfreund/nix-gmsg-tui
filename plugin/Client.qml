@@ -66,7 +66,7 @@ Item {
         }
         root.seq += 1;
         var id = root.seq;
-        var ms = method === "send" ? 125000 : 20000;
+        var ms = method === "send" ? 125000 : (method.indexOf("media.") === 0 ? 65000 : 20000);
         var t = timeoutTimer.createObject(root, { reqId: id, interval: ms, running: true });
         root.pending[id] = { cb: cb || null, timer: t };
         sock.write(JSON.stringify({ id: id, method: method, params: params || ({}) }) + "\n");

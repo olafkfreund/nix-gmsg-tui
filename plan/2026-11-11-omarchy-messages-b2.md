@@ -351,7 +351,14 @@ Thread root, keyed by `message + ":" + index` or by message id, not in delegates
 
 ## Deviations
 
-None yet.
+- **Step 3, the emoji bar:** it floats over the top edge of the bubble (z above, outside
+  the layout) instead of sitting above it. A bar that takes layout space on hover shifts
+  the list under the pointer and can flicker. While it shows, it covers the sender name
+  or the first line.
+- **Step 3, tooltip:** `gmessages.react` is defined but not shown. The picker tooltip was
+  dropped, because `ToolTip` isn't imported in `Thread.qml`.
+- **Step 3, reaction errors:** a failed `react` shows its error in the composer's status
+  line.
 
 ## Tests
 
