@@ -79,6 +79,8 @@ struct Daemon {
     key_busy: bool,
     data: PathBuf,
     avatar_dir: PathBuf,
+    media_dir: PathBuf,
+    downloads: Option<PathBuf>,
     tx: mpsc::Sender<Incoming>,
 }
 
@@ -135,7 +137,7 @@ async fn serve() -> io::Result<()> {
 async fn serve_bound(
     listener: UnixListener,
     data: PathBuf,
-    _media: &Path,
+    media: &Path,
     avatar_dir: PathBuf,
 ) -> io::Result<()> {
     trim_log(&data.join("phone.log"))?;
@@ -156,6 +158,8 @@ async fn serve_bound(
         key_busy: false,
         data,
         avatar_dir,
+        media_dir: media.to_path_buf(),
+        downloads: dirs::download_dir(),
         tx,
     };
     daemon.start_key();
@@ -283,6 +287,8 @@ impl Daemon {
                     Rc::new(store),
                     commands.clone(),
                     self.avatar_dir.clone(),
+                    self.media_dir.clone(),
+                    self.downloads.clone(),
                 ));
                 self.commands = Some(commands);
                 self.control = Some(control);
@@ -375,7 +381,18 @@ impl Daemon {
             client.reader.abort();
             client.writer.abort();
         }
-        self.pending.retain(|_, pending| pending.conn != conn);
+        let dropped: Vec<_> = self
+            .pending
+            .iter()
+            .filter(|(_, p)| p.conn == conn)
+            .map(|(&rid, _)| rid)
+            .collect();
+        for rid in dropped {
+            self.pending.remove(&rid);
+            if let Some(sync) = &mut self.sync {
+                sync.forget(rid);
+            }
+        }
         if let Some(sync) = &mut self.sync {
             sync.drop_conn(conn);
         }
@@ -450,6 +467,9 @@ impl Daemon {
             .collect();
         for rid in expired {
             if let Some(pending) = self.pending.remove(&rid) {
+                if let Some(sync) = &mut self.sync {
+                    sync.forget(rid);
+                }
                 self.write(
                     pending.conn,
                     &proto::Reply::err(
@@ -724,6 +744,58 @@ impl Daemon {
                     Err(e) => Err(e),
                 }
             }
+            "media.open" | "media.save" => {
+                let save = request.method == "media.save";
+                match params::<proto::MediaParams>(request.params) {
+                    Ok(p) if !p.message.is_empty() => {
+                        let rid = self.next_rid;
+                        self.next_rid += 1;
+                        self.pending.insert(
+                            rid,
+                            Pending {
+                                conn,
+                                id,
+                                until: Instant::now() + Duration::from_secs(60),
+                            },
+                        );
+                        let out = self
+                            .sync
+                            .as_mut()
+                            .expect("store checked")
+                            .media(rid, &p.message, p.index, save);
+                        self.outputs(out);
+                        return;
+                    }
+                    Ok(_) => reply = Err("message required".into()),
+                    Err(e) => reply = Err(e),
+                }
+            }
+            "react" if self.state != proto::State::Ready => {
+                self.write(conn, &self.unready(Some(id)));
+                return;
+            }
+            "react" => match params::<proto::ReactParams>(request.params) {
+                Ok(p)
+                    if !p.conversation.is_empty()
+                        && !p.message.is_empty()
+                        && !p.emoji.is_empty() =>
+                {
+                    let rid = self.next_rid;
+                    self.next_rid += 1;
+                    self.pending.insert(
+                        rid,
+                        Pending {
+                            conn,
+                            id,
+                            until: Instant::now() + Duration::from_secs(15),
+                        },
+                    );
+                    self.sync.as_mut().expect("store checked").react(rid, p);
+                    return;
+                }
+                Ok(_) => reply = Err("conversation, message and emoji required".into()),
+                Err(e) => reply = Err(e),
+            },
             "send" => {
                 reply = match params::<proto::SendParams>(request.params) {
                     Ok(p) if p.conversation.is_empty() || p.text.is_empty() => {

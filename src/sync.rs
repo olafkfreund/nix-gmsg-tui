@@ -32,10 +32,29 @@ pub struct Sync {
     next_token: u64,
     ready: bool,
     avatar_dir: PathBuf,
+    media_dir: PathBuf,
+    downloads: Option<PathBuf>,
+    waiters: HashMap<u64, Waiter>,
+    queues: HashMap<String, VecDeque<u32>>,
+    downloads_in_flight: HashMap<u64, (String, u32)>,
+    reacts: HashSet<u64>,
+}
+
+struct Waiter {
+    message: String,
+    index: u32,
+    save: bool,
+    ms: i64,
 }
 
 impl Sync {
-    pub fn new(store: Rc<store::Store>, commands: phone::Commands, avatar_dir: PathBuf) -> Self {
+    pub fn new(
+        store: Rc<store::Store>,
+        commands: phone::Commands,
+        avatar_dir: PathBuf,
+        media_dir: PathBuf,
+        downloads: Option<PathBuf>,
+    ) -> Self {
         let stored = store.conversation_list().unwrap_or_default();
         let meta = stored
             .iter()
@@ -71,6 +90,12 @@ impl Sync {
             next_token: 0,
             ready: false,
             avatar_dir,
+            media_dir,
+            downloads,
+            waiters: HashMap::new(),
+            queues: HashMap::new(),
+            downloads_in_flight: HashMap::new(),
+            reacts: HashSet::new(),
         }
     }
 
@@ -414,6 +439,254 @@ impl Sync {
         out
     }
 
+    fn reply(rid: u64, code: proto::ErrorCode, message: &'static str) -> proto::Out {
+        proto::Out::Reply {
+            rid,
+            result: Err(proto::ErrorBody {
+                code,
+                message: message.into(),
+            }),
+        }
+    }
+
+    fn start_download(&mut self, message: &str, index: u32) -> bool {
+        let medium = self.store.message(message).ok().flatten().and_then(|m| {
+            m.media
+                .into_iter()
+                .filter(|v| serde_json::from_value::<phone::Medium>(v.clone()).is_ok())
+                .nth(index as usize)
+        });
+        if let Some(medium) = medium {
+            self.next_token += 1;
+            let id = self.next_token;
+            self.downloads_in_flight.insert(id, (message.into(), index));
+            self.commands.send(phone::Command::Download {
+                id,
+                message: message.into(),
+                media: vec![medium],
+            });
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn media(&mut self, rid: u64, message: &str, index: u32, save: bool) -> Vec<proto::Out> {
+        let Ok(Some(stored)) = self.store.message(message) else {
+            return vec![Self::reply(
+                rid,
+                proto::ErrorCode::NotFound,
+                "message not found",
+            )];
+        };
+        if stored
+            .media
+            .iter()
+            .filter(|v| serde_json::from_value::<phone::Medium>((*v).clone()).is_ok())
+            .nth(index as usize)
+            .is_none()
+        {
+            return vec![Self::reply(
+                rid,
+                proto::ErrorCode::NotFound,
+                "no such attachment",
+            )];
+        }
+        let waiter = Waiter {
+            message: message.into(),
+            index,
+            save,
+            ms: stored.timestamp_ms,
+        };
+        match self.store.attachment(message, index) {
+            Ok(Some(attachment)) => return vec![self.finish(rid, &waiter, &attachment, true)],
+            Err(error) => tracing::warn!(%error, "cannot read attachment"),
+            Ok(None) => {}
+        }
+        if !self.ready {
+            return vec![Self::reply(
+                rid,
+                proto::ErrorCode::PhoneOffline,
+                "phone did not send it",
+            )];
+        }
+        self.waiters.insert(rid, waiter);
+        let queue = self.queues.entry(message.into()).or_default();
+        if !queue.contains(&index) {
+            let start = queue.is_empty();
+            queue.push_back(index);
+            if start && !self.start_download(message, index) {
+                self.waiters.remove(&rid);
+                self.queues.remove(message);
+                return vec![Self::reply(
+                    rid,
+                    proto::ErrorCode::NotFound,
+                    "no such attachment",
+                )];
+            }
+        }
+        Vec::new()
+    }
+
+    fn finish(&self, rid: u64, waiter: &Waiter, a: &store::Attachment, full: bool) -> proto::Out {
+        if a.bytes.len() > 100 * 1024 * 1024 {
+            return Self::reply(rid, proto::ErrorCode::Internal, "too large");
+        }
+        let ext = extension(&a.content_type);
+        let mut hash = Sha256::new();
+        hash.update(waiter.message.as_bytes());
+        hash.update([0]);
+        hash.update(waiter.index.to_be_bytes());
+        let suffix = if full { "" } else { "-preview" };
+        let path = self
+            .media_dir
+            .join(format!("{:x}{suffix}.{ext}", hash.finalize()));
+        let result = (|| -> io::Result<PathBuf> {
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+            {
+                Ok(mut file) => file.write_all(&a.bytes)?,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+            if waiter.save {
+                let downloads = self.downloads.as_ref().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "no Downloads folder")
+                })?;
+                save_download(downloads, a, waiter.ms, ext)
+            } else {
+                Ok(path)
+            }
+        })();
+        match result {
+            Ok(path) => proto::Out::Reply {
+                rid,
+                result: Ok(to_value(proto::MediaData {
+                    path: path.to_string_lossy().into_owned(),
+                })
+                .expect("media data serializes")),
+            },
+            Err(error) => {
+                tracing::debug!(%error, "cannot write media file");
+                let message = match error.to_string().as_str() {
+                    "no Downloads folder" => "no Downloads folder",
+                    "no free file name" => "no free file name",
+                    _ => "cannot write the file",
+                };
+                Self::reply(rid, proto::ErrorCode::Internal, message)
+            }
+        }
+    }
+
+    fn downloaded(
+        &mut self,
+        id: u64,
+        attachments: Vec<phone::Attachment>,
+        error: Option<String>,
+    ) -> Vec<proto::Out> {
+        let Some((message, index)) = self.downloads_in_flight.remove(&id) else {
+            return Vec::new();
+        };
+        if let Some(error) = &error {
+            tracing::debug!(%error, "phone download failed");
+        }
+        let oversized = attachments
+            .first()
+            .is_some_and(|a| a.data.len() > 100 * 1024 * 1024)
+            || error.as_deref() == Some("too large");
+        let attachment = attachments.into_iter().next().filter(|_| !oversized);
+        let attachment = attachment.map(|a| {
+            let stored = store::Attachment {
+                content_type: a.content_type,
+                file_name: a.name,
+                bytes: a.data,
+                width: a.width,
+                height: a.height,
+            };
+            if a.full
+                && let Err(error) = self.store.save_attachment(&message, index, &stored)
+            {
+                tracing::warn!(%error, "cannot cache attachment");
+            }
+            (stored, a.full)
+        });
+        let mut ids: Vec<_> = self
+            .waiters
+            .iter()
+            .filter(|(_, w)| w.message == message && w.index == index)
+            .map(|(&rid, _)| rid)
+            .collect();
+        ids.sort_unstable();
+        let mut out = Vec::new();
+        for rid in ids {
+            let waiter = self.waiters.remove(&rid).expect("waiter exists");
+            out.push(match &attachment {
+                Some((a, full)) => self.finish(rid, &waiter, a, *full),
+                None if oversized => Self::reply(rid, proto::ErrorCode::Internal, "too large"),
+                None => Self::reply(rid, proto::ErrorCode::PhoneOffline, "phone did not send it"),
+            });
+        }
+        if let Some(queue) = self.queues.get_mut(&message) {
+            queue.pop_front();
+        }
+        while let Some(next) = self.queues.get(&message).and_then(|q| q.front().copied()) {
+            if self.start_download(&message, next) {
+                break;
+            }
+            self.queues.get_mut(&message).unwrap().pop_front();
+            let ids: Vec<_> = self
+                .waiters
+                .iter()
+                .filter(|(_, w)| w.message == message && w.index == next)
+                .map(|(&rid, _)| rid)
+                .collect();
+            for rid in ids {
+                self.waiters.remove(&rid);
+                out.push(Self::reply(
+                    rid,
+                    proto::ErrorCode::NotFound,
+                    "no such attachment",
+                ));
+            }
+        }
+        if self.queues.get(&message).is_some_and(VecDeque::is_empty) {
+            self.queues.remove(&message);
+        }
+        out
+    }
+
+    pub fn forget(&mut self, rid: u64) {
+        self.waiters.remove(&rid);
+        self.reacts.remove(&rid);
+    }
+
+    pub fn react(&mut self, rid: u64, p: proto::ReactParams) {
+        self.reacts.insert(rid);
+        self.commands.send(phone::Command::React {
+            id: rid,
+            conversation: p.conversation,
+            message: p.message,
+            emoji: p.emoji,
+            op: p.op.into(),
+        });
+    }
+
+    fn reset_media(&mut self) -> Vec<proto::Out> {
+        if let Err(error) = crate::serve::clear_media(&self.media_dir) {
+            tracing::warn!(%error, "cannot clear media directory");
+        }
+        let ids: Vec<_> = self.waiters.keys().copied().collect();
+        self.waiters.clear();
+        self.queues.clear();
+        self.downloads_in_flight.clear();
+        ids.into_iter()
+            .map(|rid| Self::reply(rid, proto::ErrorCode::NotPaired, "phone not paired"))
+            .collect()
+    }
+
     pub fn handle(&mut self, event: phone::Event) -> Vec<proto::Out> {
         match event {
             phone::Event::Login => {
@@ -461,7 +734,9 @@ impl Sync {
             phone::Event::Paired => {
                 self.lose_ready();
                 self.reset_avatars();
-                vec![Self::state(proto::State::Connecting, None)]
+                let mut out = self.reset_media();
+                out.push(Self::state(proto::State::Connecting, None));
+                out
             }
             phone::Event::Connected => {
                 self.lose_ready();
@@ -614,10 +889,12 @@ impl Sync {
             phone::Event::Unpaired { .. } => {
                 self.lose_ready();
                 self.reset_avatars();
-                vec![Self::state(
+                let mut out = self.reset_media();
+                out.push(Self::state(
                     proto::State::Login,
                     Some("unpaired_remotely".into()),
-                )]
+                ));
+                out
             }
             phone::Event::Fatal { message } => {
                 self.lose_ready();
@@ -628,8 +905,27 @@ impl Sync {
                 tracing::info!(%message, "phone status");
                 Vec::new()
             }
+            phone::Event::Downloaded {
+                id,
+                attachments,
+                error,
+            } => self.downloaded(id, attachments, error),
+            phone::Event::Done { id, error } if self.reacts.remove(&id) => {
+                if let Some(error) = error {
+                    tracing::debug!(%error, "phone reaction failed");
+                    vec![Self::reply(
+                        id,
+                        proto::ErrorCode::PhoneOffline,
+                        "phone refused the reaction",
+                    )]
+                } else {
+                    vec![proto::Out::Reply {
+                        rid: id,
+                        result: Ok(to_value(serde_json::json!({})).unwrap()),
+                    }]
+                }
+            }
             phone::Event::Done { .. }
-            | phone::Event::Downloaded { .. }
             | phone::Event::Contacts { .. }
             | phone::Event::Started { .. } => {
                 tracing::debug!("stage-a phone event ignored");
@@ -775,6 +1071,95 @@ fn save_avatar(dir: &Path, image: &[u8]) -> io::Result<Option<String>> {
     Ok(Some(path.to_string_lossy().into_owned()))
 }
 
+fn extension(mime: &str) -> &'static str {
+    match mime
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "image/jpeg" => "jpg",
+        "image/png" => "png",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/heic" => "heic",
+        "video/mp4" => "mp4",
+        "video/3gpp" => "3gp",
+        "audio/mpeg" => "mp3",
+        "audio/ogg" => "ogg",
+        "application/pdf" => "pdf",
+        "text/x-vcard" | "text/vcard" => "vcf",
+        _ => "bin",
+    }
+}
+
+fn save_download(dir: &Path, a: &store::Attachment, ms: i64, ext: &str) -> io::Result<PathBuf> {
+    fs::create_dir_all(dir)?;
+    let raw = a
+        .file_name
+        .as_deref()
+        .unwrap_or("")
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("");
+    let mut name: String = raw.chars().filter(|c| !c.is_control()).collect();
+    while name.len() > 200 {
+        name.pop();
+    }
+    if name.is_empty() || name == "." || name == ".." || name.starts_with('.') {
+        name = format!("message-{ms}.{ext}");
+    } else if Path::new(&name).extension().is_none_or(|e| e.is_empty()) {
+        name.push('.');
+        name.push_str(ext);
+    }
+    let (stem, suffix) = name.rsplit_once('.').unwrap_or((&name, ""));
+    let mut temp = None;
+    for _ in 0..10 {
+        let mut random = [0u8; 8];
+        getrandom::fill(&mut random).map_err(|e| io::Error::other(e.to_string()))?;
+        let path = dir.join(format!(
+            ".gmessages-{:016x}.part",
+            u64::from_be_bytes(random)
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(file) => {
+                temp = Some((path, file));
+                break;
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let (temp_path, mut file) = temp.ok_or_else(|| io::Error::other("cannot write the file"))?;
+    let result = (|| -> io::Result<PathBuf> {
+        file.write_all(&a.bytes)?;
+        drop(file);
+        for n in 1..=99 {
+            let candidate = if n == 1 {
+                name.clone()
+            } else {
+                format!("{stem} ({n}).{suffix}")
+            };
+            let path = dir.join(candidate);
+            match fs::hard_link(&temp_path, &path) {
+                Ok(()) => return Ok(path),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::other("no free file name"))
+    })();
+    let _ = fs::remove_file(temp_path);
+    result
+}
+
 /// Bytes of messages one history line may carry, well under the daemon's 1 MiB line limit.
 const HISTORY_BYTES: usize = 768 * 1024;
 
@@ -875,8 +1260,268 @@ mod tests {
             .unwrap();
         let (commands, received) = phone::Commands::detached();
         let avatar_dir = path.with_extension("avatars");
+        let media_dir = path.with_extension("media");
+        let downloads = path.with_extension("downloads");
         crate::serve::clear_media(&avatar_dir).unwrap();
-        (Sync::new(store, commands, avatar_dir), received)
+        crate::serve::clear_media(&media_dir).unwrap();
+        crate::serve::clear_media(&downloads).unwrap();
+        (
+            Sync::new(store, commands, avatar_dir, media_dir, Some(downloads)),
+            received,
+        )
+    }
+
+    fn with_media(sync: &Sync, media: Vec<Value>) {
+        let mut m = message("media", 1234, false, false);
+        m.media = media;
+        sync.store.save_messages("c", &[m]).unwrap();
+    }
+
+    fn medium(name: &str, mime: &str) -> Value {
+        json!({"name": name, "mime": mime, "media_id": "secret"})
+    }
+
+    fn attachment(name: &str, full: bool) -> phone::Attachment {
+        phone::Attachment {
+            content_type: "image/png".into(),
+            name: Some(name.into()),
+            data: b"image".to_vec(),
+            width: None,
+            height: None,
+            full,
+        }
+    }
+
+    fn path(out: &[proto::Out], rid: u64) -> PathBuf {
+        let proto::Out::Reply {
+            rid: got,
+            result: Ok(data),
+        } = &out[0]
+        else {
+            panic!("media reply")
+        };
+        assert_eq!(*got, rid);
+        PathBuf::from(data["path"].as_str().unwrap())
+    }
+
+    fn error(out: &[proto::Out], code: proto::ErrorCode) {
+        assert!(matches!(&out[0], proto::Out::Reply { result: Err(e), .. } if e.code == code));
+    }
+
+    #[test]
+    fn media_cached_offline_and_valid_index_filter() {
+        let (mut sync, mut commands) = sync();
+        with_media(
+            &sync,
+            vec![json!({"bad": true}), medium("x.png", "image/png")],
+        );
+        error(
+            &sync.media(1, "missing", 0, false),
+            proto::ErrorCode::NotFound,
+        );
+        error(
+            &sync.media(2, "media", 1, false),
+            proto::ErrorCode::NotFound,
+        );
+        error(
+            &sync.media(3, "media", 0, false),
+            proto::ErrorCode::PhoneOffline,
+        );
+        sync.store
+            .save_attachment(
+                "media",
+                0,
+                &store::Attachment {
+                    content_type: "image/png".into(),
+                    file_name: Some("x.png".into()),
+                    bytes: b"cached".to_vec(),
+                    width: None,
+                    height: None,
+                },
+            )
+            .unwrap();
+        let out = sync.media(4, "media", 0, false);
+        assert_eq!(fs::read(path(&out, 4)).unwrap(), b"cached");
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn media_miss_shares_download_and_serializes_indexes() {
+        let (mut sync, mut commands) = sync();
+        with_media(
+            &sync,
+            vec![medium("a.png", "image/png"), medium("b.png", "image/png")],
+        );
+        sync.ready = true;
+        assert!(sync.media(1, "media", 0, false).is_empty());
+        assert!(sync.media(2, "media", 0, false).is_empty());
+        assert!(sync.media(3, "media", 1, false).is_empty());
+        let phone::Command::Download { id, media, .. } = commands.try_recv().unwrap() else {
+            panic!("download")
+        };
+        assert_eq!(media.len(), 1);
+        assert!(commands.try_recv().is_err());
+        let out = sync.handle(phone::Event::Downloaded {
+            id,
+            attachments: vec![attachment("a.png", true)],
+            error: None,
+        });
+        assert_eq!(out.len(), 2);
+        assert_eq!(path(&out[..1], 1), path(&out[1..], 2));
+        assert_eq!(
+            fs::metadata(path(&out[..1], 1))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let phone::Command::Download { id, media, .. } = commands.try_recv().unwrap() else {
+            panic!("second download")
+        };
+        assert_eq!(media.len(), 1);
+        let out = sync.handle(phone::Event::Downloaded {
+            id,
+            attachments: vec![attachment("b.png", true)],
+            error: None,
+        });
+        assert!(path(&out, 3).exists());
+        assert!(sync.store.attachment("media", 0).unwrap().is_some());
+    }
+
+    #[test]
+    fn forgotten_download_caches_without_writing_and_preview_does_not_cache() {
+        let (mut sync, mut commands) = sync();
+        with_media(&sync, vec![medium("x.png", "image/png")]);
+        sync.ready = true;
+        sync.media(1, "media", 0, true);
+        let phone::Command::Download { id, .. } = commands.try_recv().unwrap() else {
+            panic!("download")
+        };
+        sync.forget(1);
+        assert!(
+            sync.handle(phone::Event::Downloaded {
+                id,
+                attachments: vec![attachment("x.png", true)],
+                error: None
+            })
+            .is_empty()
+        );
+        assert!(sync.store.attachment("media", 0).unwrap().is_some());
+        assert_eq!(fs::read_dir(&sync.media_dir).unwrap().count(), 0);
+        assert_eq!(
+            fs::read_dir(sync.downloads.as_ref().unwrap())
+                .unwrap()
+                .count(),
+            0
+        );
+
+        sync.store
+            .save_messages(
+                "c",
+                &[{
+                    let mut m = message("preview", 1234, false, false);
+                    m.media = vec![medium("x.png", "image/png")];
+                    m
+                }],
+            )
+            .unwrap();
+        sync.media(2, "preview", 0, false);
+        let phone::Command::Download { id, .. } = commands.try_recv().unwrap() else {
+            panic!("preview download")
+        };
+        let out = sync.handle(phone::Event::Downloaded {
+            id,
+            attachments: vec![attachment("x.png", false)],
+            error: None,
+        });
+        assert!(path(&out, 2).to_string_lossy().contains("-preview.png"));
+        assert!(sync.store.attachment("preview", 0).unwrap().is_none());
+    }
+
+    #[test]
+    fn media_save_names_and_does_not_overwrite() {
+        let (mut sync, _) = sync();
+        with_media(&sync, vec![medium("name.png", "image/png")]);
+        sync.store
+            .save_attachment(
+                "media",
+                0,
+                &store::Attachment {
+                    content_type: "image/png".into(),
+                    file_name: Some("name.png".into()),
+                    bytes: b"new".to_vec(),
+                    width: None,
+                    height: None,
+                },
+            )
+            .unwrap();
+        let downloads = sync.downloads.as_ref().unwrap().clone();
+        fs::write(downloads.join("name.png"), b"old").unwrap();
+        let first = path(&sync.media(1, "media", 0, true), 1);
+        let second = path(&sync.media(2, "media", 0, true), 2);
+        assert_eq!(first.file_name().unwrap(), "name (2).png");
+        assert_eq!(second.file_name().unwrap(), "name (3).png");
+        assert_eq!(fs::read(downloads.join("name.png")).unwrap(), b"old");
+        assert_eq!(fs::read(first).unwrap(), b"new");
+        for (name, mime, expected) in [
+            ("../x.png", "image/png", "x.png"),
+            (".hidden", "image/png", "message-1234.png"),
+            ("", "IMAGE/JPEG; q=1", "message-1234.jpg"),
+        ] {
+            let a = store::Attachment {
+                content_type: mime.into(),
+                file_name: Some(name.into()),
+                bytes: b"x".to_vec(),
+                width: None,
+                height: None,
+            };
+            let dir = downloads.join(format!("case-{expected}"));
+            assert_eq!(
+                save_download(&dir, &a, 1234, extension(mime))
+                    .unwrap()
+                    .file_name()
+                    .unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn react_done_and_unpair_waiters() {
+        let (mut sync, mut commands) = sync();
+        for (rid, failed) in [(1, false), (2, true)] {
+            sync.react(
+                rid,
+                proto::ReactParams {
+                    conversation: "c".into(),
+                    message: "media".into(),
+                    emoji: "👍".into(),
+                    op: proto::ReactOp::Add,
+                },
+            );
+            assert!(
+                matches!(commands.try_recv().unwrap(), phone::Command::React { id, .. } if id == rid)
+            );
+            let out = sync.handle(phone::Event::Done {
+                id: rid,
+                error: failed.then(|| "secret error".into()),
+            });
+            if failed {
+                error(&out, proto::ErrorCode::PhoneOffline);
+            } else {
+                assert!(matches!(&out[0], proto::Out::Reply { result: Ok(_), .. }));
+            }
+        }
+        with_media(&sync, vec![medium("x.png", "image/png")]);
+        sync.ready = true;
+        sync.media(3, "media", 0, false);
+        fs::write(sync.media_dir.join("old"), b"x").unwrap();
+        let out = sync.handle(phone::Event::Unpaired {
+            reason: "bye".into(),
+        });
+        error(&out, proto::ErrorCode::NotPaired);
+        assert_eq!(fs::read_dir(&sync.media_dir).unwrap().count(), 0);
     }
 
     fn data(out: &[proto::Out], event: &str) -> Vec<Value> {

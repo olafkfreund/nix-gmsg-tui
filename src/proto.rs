@@ -329,7 +329,6 @@ pub struct SendParams {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[allow(dead_code, reason = "used in plan b2 step 2")]
 pub struct ReactParams {
     pub conversation: String,
     pub message: String,
@@ -356,14 +355,12 @@ impl From<ReactOp> for gmessages_proto::ReactionOp {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[allow(dead_code, reason = "used in plan b2 step 2")]
 pub struct MediaParams {
     pub message: String,
     pub index: u32,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[allow(dead_code, reason = "used in plan b2 step 2")]
 pub struct MediaData {
     pub path: String,
 }
