@@ -78,6 +78,7 @@ struct Daemon {
     pair_status: Option<mpsc::Sender<PairStatus>>,
     key_busy: bool,
     data: PathBuf,
+    avatar_dir: PathBuf,
     tx: mpsc::Sender<Incoming>,
 }
 
@@ -116,19 +117,27 @@ async fn serve() -> io::Result<()> {
     let _lock = lock(&data.join("lock"))?;
     let media = runtime.join("media");
     clear_media(&media)?;
+    let avatars = runtime.join("avatars");
+    clear_media(&avatars)?;
     let socket = runtime.join("daemon.sock");
     if socket.exists() {
         std::fs::remove_file(&socket)?;
     }
     let listener = UnixListener::bind(&socket)?;
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
-    let result = serve_bound(listener, data, &media).await;
+    let result = serve_bound(listener, data, &media, avatars.clone()).await;
     let _ = std::fs::remove_file(&socket);
     let _ = clear_media(&media);
+    let _ = clear_media(&avatars);
     result
 }
 
-async fn serve_bound(listener: UnixListener, data: PathBuf, _media: &Path) -> io::Result<()> {
+async fn serve_bound(
+    listener: UnixListener,
+    data: PathBuf,
+    _media: &Path,
+    avatar_dir: PathBuf,
+) -> io::Result<()> {
     trim_log(&data.join("phone.log"))?;
     phone::log::init(&data.join("phone.log"));
     let (tx, mut rx) = mpsc::channel(QUEUE);
@@ -146,6 +155,7 @@ async fn serve_bound(listener: UnixListener, data: PathBuf, _media: &Path) -> io
         pair_status: None,
         key_busy: false,
         data,
+        avatar_dir,
         tx,
     };
     daemon.start_key();
@@ -269,7 +279,11 @@ impl Daemon {
                 };
                 let phone = phone::Phone::start(&session);
                 let (mut events, commands, control) = phone.split();
-                self.sync = Some(sync::Sync::new(Rc::new(store), commands.clone()));
+                self.sync = Some(sync::Sync::new(
+                    Rc::new(store),
+                    commands.clone(),
+                    self.avatar_dir.clone(),
+                ));
                 self.commands = Some(commands);
                 self.control = Some(control);
                 self.set_state(state, None);
@@ -664,7 +678,7 @@ impl Daemon {
                 reply = match params::<proto::ConversationsParams>(request.params) {
                     Ok(p) if p.offset >= 0 && (1..=200).contains(&p.limit) => self
                         .sync
-                        .as_ref()
+                        .as_mut()
                         .map(|s| to_value(s.conversations(p.folder, p.offset, p.limit)).unwrap())
                         .ok_or_else(|| "store unavailable".to_owned()),
                     Ok(_) => Err("offset or limit out of range".into()),
@@ -876,7 +890,7 @@ fn lock(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
-fn clear_media(path: &Path) -> io::Result<()> {
+pub(crate) fn clear_media(path: &Path) -> io::Result<()> {
     if path.exists() {
         std::fs::remove_dir_all(path)?;
     }

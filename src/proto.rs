@@ -4,6 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 use crate::{phone, store};
 
@@ -143,6 +144,8 @@ pub struct Conversation {
     pub unread: bool,
     pub last_ms: i64,
     pub snippet: String,
+    pub color: String,
+    pub avatar: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -175,7 +178,7 @@ fn folder(folder: &Option<String>) -> String {
 }
 
 impl Conversation {
-    pub fn from_phone(c: &phone::Conversation) -> Self {
+    pub fn from_phone(c: &phone::Conversation, color: String, avatar: Option<String>) -> Self {
         Self {
             id: c.id.clone(),
             name: c.name.clone(),
@@ -188,10 +191,12 @@ impl Conversation {
                 .latest
                 .as_ref()
                 .map_or_else(String::new, |l| snippet(&l.text)),
+            color,
+            avatar,
         }
     }
 
-    pub fn from_store(c: &store::Conversation) -> Self {
+    pub fn from_store(c: &store::Conversation, color: String, avatar: Option<String>) -> Self {
         Self {
             id: c.id.clone(),
             name: c.name.clone(),
@@ -204,6 +209,8 @@ impl Conversation {
                 .messages
                 .last()
                 .map_or_else(String::new, |m| snippet(&m.text)),
+            color,
+            avatar,
         }
     }
 }
@@ -372,6 +379,11 @@ pub struct ConversationEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AvatarsEvent {
+    pub items: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HistoryEvent {
     pub conversation: String,
     pub messages: Vec<Message>,
@@ -507,7 +519,7 @@ mod tests {
             colour: "#1a73e8".into(),
             avatar_id: Some("c:contact".into()),
         };
-        let conv = Conversation::from_phone(&pc);
+        let conv = Conversation::from_phone(&pc, "#1a73e8".into(), Some("/avatar.png".into()));
         assert_eq!(conv.folder, "inbox");
         assert_eq!(conv.snippet, "hello");
         let sc = store::Conversation {
@@ -522,7 +534,7 @@ mod tests {
             avatar_id: None,
             messages: vec![m.clone()],
         };
-        let from_store = Conversation::from_store(&sc);
+        let from_store = Conversation::from_store(&sc, String::new(), None);
         assert_eq!(from_store.folder, "archive");
         assert_eq!(from_store.snippet, "hello");
 
@@ -557,6 +569,10 @@ mod tests {
             })
             .unwrap(),
             serde_json::to_string(&ConversationEvent { conversation: conv }).unwrap(),
+            serde_json::to_string(&AvatarsEvent {
+                items: BTreeMap::from([("c1".into(), "/avatar.png".into())]),
+            })
+            .unwrap(),
         ];
         for line in wire {
             assert!(!line.contains("SECRET"), "secret on the wire: {line}");
