@@ -10,6 +10,10 @@ use std::path::Path;
 const KEYRING_SERVICE: &str = "gmessages-tui";
 const PASSPHRASE_VAR: &str = "GMESSAGES_TUI_PASSPHRASE";
 
+pub(crate) fn passphrase() -> Option<String> {
+    std::env::var(PASSPHRASE_VAR).ok()
+}
+
 #[derive(Debug)]
 pub enum KeyError {
     Empty,
@@ -41,7 +45,7 @@ fn keyring_error(error: keyring::Error) -> KeyError {
 /// The key of the store at `path`: `$GMESSAGES_TUI_PASSPHRASE`, else its keyring entry
 /// (a new random key if there is none and no store yet).
 pub fn store_key(path: &Path) -> Result<String, KeyError> {
-    if let Ok(passphrase) = std::env::var(PASSPHRASE_VAR) {
+    if let Some(passphrase) = passphrase() {
         return if passphrase.is_empty() {
             Err(KeyError::Empty)
         } else {
@@ -67,14 +71,11 @@ pub fn store_key(path: &Path) -> Result<String, KeyError> {
     }
 }
 
-/// Deletes the keyring entry of the store at `path`, if any. An unreachable keyring has
-/// no entry available to delete.
+/// Deletes the keyring entry of the store at `path`, if any.
 pub fn forget(path: &Path) -> Result<(), Box<dyn Error>> {
-    let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &path.to_string_lossy()) else {
-        return Ok(());
-    };
+    let entry = keyring::Entry::new(KEYRING_SERVICE, &path.to_string_lossy())?;
     match entry.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) | Err(keyring::Error::NoStorageAccess(_)) => Ok(()),
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => Err(format!("cannot delete the store key from the keyring: {e}").into()),
     }
 }

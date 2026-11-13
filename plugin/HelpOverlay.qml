@@ -82,6 +82,11 @@ Item {
                     { keys: "i", desc: I18n.t("gmessages.help_compose", "Focus message composer") },
                     { keys: "Ctrl+Return", desc: I18n.t("gmessages.help_send", "Send message") },
                     { keys: "/", desc: I18n.t("gmessages.help_filter", "Filter conversations") },
+                    { keys: "n", desc: I18n.t("gmessages.help_new", "New chat") },
+                    { keys: "a", desc: I18n.t("gmessages.help_folder", "Switch between Inbox and Archived") },
+                    { keys: "e", desc: I18n.t("gmessages.help_archive", "Archive or restore conversation") },
+                    { keys: "Delete / #", desc: I18n.t("gmessages.help_delete", "Delete conversation (or the message under the pointer)") },
+                    { keys: "\u22EE", desc: I18n.t("gmessages.help_menu", "Menu: unpair phone, remove all data") },
                     { keys: "Esc", desc: I18n.t("gmessages.help_back", "Back to conversation list or hide window") },
                     { keys: "?", desc: I18n.t("gmessages.help_toggle", "Toggle keyboard shortcuts") },
                     { keys: "q", desc: I18n.t("gmessages.help_quit", "Hide window") }

@@ -321,6 +321,24 @@ pub struct ConversationParams {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ContactsParams {
+    #[serde(default)]
+    pub offset: usize,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct StartChatParams {
+    pub numbers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DeleteMessageParams {
+    pub conversation: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SendParams {
     pub conversation: String,
     pub text: String,
@@ -393,6 +411,30 @@ pub struct HelloEvent {
 pub struct ConversationsData {
     pub items: Vec<Conversation>,
     pub total: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContactDto {
+    pub name: String,
+    pub number: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContactsData {
+    pub items: Vec<ContactDto>,
+    pub total: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StartChatData {
+    pub conversation: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GoneEvent {
+    pub conversation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -657,6 +699,37 @@ mod tests {
             })
             .unwrap(),
             serde_json::to_string(&ConversationEvent { conversation: conv }).unwrap(),
+            serde_json::to_string(&ContactsParams {
+                offset: 0,
+                limit: 200,
+            })
+            .unwrap(),
+            serde_json::to_string(&StartChatParams {
+                numbers: vec!["123".into()],
+            })
+            .unwrap(),
+            serde_json::to_string(&DeleteMessageParams {
+                conversation: "c1".into(),
+                message: "m1".into(),
+            })
+            .unwrap(),
+            serde_json::to_string(&ContactsData {
+                items: vec![ContactDto {
+                    name: "Ann".into(),
+                    number: "123".into(),
+                }],
+                total: 1,
+            })
+            .unwrap(),
+            serde_json::to_string(&StartChatData {
+                conversation: "c1".into(),
+            })
+            .unwrap(),
+            serde_json::to_string(&GoneEvent {
+                conversation: "c1".into(),
+                message: Some("m1".into()),
+            })
+            .unwrap(),
             serde_json::to_string(&AvatarsEvent {
                 items: BTreeMap::from([("c1".into(), "/avatar.png".into())]),
             })

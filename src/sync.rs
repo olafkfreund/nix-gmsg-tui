@@ -38,6 +38,26 @@ pub struct Sync {
     queues: HashMap<String, VecDeque<u32>>,
     downloads_in_flight: HashMap<u64, (String, u32)>,
     reacts: HashSet<u64>,
+    sends: HashSet<u64>,
+    actions: HashMap<u64, Action>,
+    forgotten_actions: HashSet<u64>,
+    contacts_cache: Vec<proto::ContactDto>,
+    deleted_messages: HashSet<String>,
+}
+
+enum Action {
+    Contacts {
+        offset: usize,
+        limit: usize,
+    },
+    StartChat,
+    Archive(String),
+    Restore(String),
+    DeleteChat(String),
+    DeleteMessage {
+        conversation: String,
+        message: String,
+    },
 }
 
 struct Waiter {
@@ -96,6 +116,11 @@ impl Sync {
             queues: HashMap::new(),
             downloads_in_flight: HashMap::new(),
             reacts: HashSet::new(),
+            sends: HashSet::new(),
+            actions: HashMap::new(),
+            forgotten_actions: HashSet::new(),
+            contacts_cache: Vec::new(),
+            deleted_messages: HashSet::new(),
         }
     }
 
@@ -650,6 +675,106 @@ impl Sync {
     pub fn forget(&mut self, rid: u64) {
         self.waiters.remove(&rid);
         self.reacts.remove(&rid);
+        // Timed out or disconnected: no one waits for it, so it no longer holds off unpair.
+        self.sends.remove(&rid);
+        if self.actions.contains_key(&rid) {
+            self.forgotten_actions.insert(rid);
+        }
+    }
+
+    pub fn busy(&self) -> bool {
+        !self.sends.is_empty()
+            || self
+                .actions
+                .keys()
+                .any(|rid| !self.forgotten_actions.contains(rid))
+    }
+
+    pub fn contacts(&mut self, rid: u64, p: proto::ContactsParams) -> Vec<proto::Out> {
+        if p.offset == 0 || self.contacts_cache.is_empty() {
+            self.contacts_cache.clear();
+            self.actions.insert(
+                rid,
+                Action::Contacts {
+                    offset: p.offset,
+                    limit: p.limit,
+                },
+            );
+            self.commands.send(phone::Command::Contacts { id: rid });
+            Vec::new()
+        } else {
+            vec![Self::ok(rid, &self.contacts_page(p.offset, p.limit))]
+        }
+    }
+
+    fn contacts_page(&self, offset: usize, limit: usize) -> proto::ContactsData {
+        proto::ContactsData {
+            items: self
+                .contacts_cache
+                .iter()
+                .skip(offset)
+                .take(limit)
+                .cloned()
+                .collect(),
+            total: self.contacts_cache.len(),
+        }
+    }
+
+    pub fn start_chat(&mut self, rid: u64, p: proto::StartChatParams) {
+        self.actions.insert(rid, Action::StartChat);
+        self.commands.send(phone::Command::StartChat {
+            id: rid,
+            numbers: p.numbers,
+        });
+    }
+
+    pub fn archive(&mut self, rid: u64, p: proto::ConversationParams) {
+        self.actions
+            .insert(rid, Action::Archive(p.conversation.clone()));
+        self.commands.send(phone::Command::Archive {
+            id: rid,
+            conversation: p.conversation,
+        });
+    }
+
+    pub fn restore(&mut self, rid: u64, p: proto::ConversationParams) {
+        self.actions
+            .insert(rid, Action::Restore(p.conversation.clone()));
+        self.commands.send(phone::Command::Restore {
+            id: rid,
+            conversation: p.conversation,
+        });
+    }
+
+    pub fn delete_chat(&mut self, rid: u64, p: proto::ConversationParams) {
+        self.actions
+            .insert(rid, Action::DeleteChat(p.conversation.clone()));
+        self.commands.send(phone::Command::DeleteChat {
+            id: rid,
+            conversation: p.conversation,
+            for_good: true,
+        });
+    }
+
+    pub fn delete_message(&mut self, rid: u64, p: proto::DeleteMessageParams) {
+        self.actions.insert(
+            rid,
+            Action::DeleteMessage {
+                conversation: p.conversation,
+                message: p.message.clone(),
+            },
+        );
+        self.commands.send(phone::Command::DeleteMessage {
+            id: rid,
+            message: p.message,
+        });
+    }
+
+    fn ok(rid: u64, data: &impl serde::Serialize) -> proto::Out {
+        proto::Out::Reply {
+            rid,
+            result: Ok(to_value(data).expect("reply data serializes")),
+        }
     }
 
     pub fn react(&mut self, rid: u64, p: proto::ReactParams) {
@@ -672,8 +797,13 @@ impl Sync {
         self.queues.clear();
         self.downloads_in_flight.clear();
         let reacts: Vec<_> = self.reacts.drain().collect();
+        let actions: Vec<_> = self.actions.drain().map(|(rid, _)| rid).collect();
+        let forgotten = std::mem::take(&mut self.forgotten_actions);
+        self.contacts_cache.clear();
+        self.deleted_messages.clear();
         ids.into_iter()
             .chain(reacts)
+            .chain(actions.into_iter().filter(|rid| !forgotten.contains(rid)))
             .map(|rid| Self::reply(rid, proto::ErrorCode::NotPaired, "phone not paired"))
             .collect()
     }
@@ -767,9 +897,13 @@ impl Sync {
                 error,
             } => {
                 let mut out = Vec::new();
-                if let Some(error) = error {
-                    tracing::warn!(%error, "cannot fetch history");
+                if error.is_some() {
+                    tracing::warn!("cannot fetch history");
                 } else {
+                    let messages: Vec<_> = messages
+                        .into_iter()
+                        .filter(|message| !self.deleted_messages.contains(&message.id))
+                        .collect();
                     for message in &messages {
                         self.remember_missed(message);
                     }
@@ -796,7 +930,13 @@ impl Sync {
                 conversation,
                 message,
                 old,
-            } => self.live(conversation, message, old),
+            } => {
+                if self.deleted_messages.contains(&message.id) {
+                    Vec::new()
+                } else {
+                    self.live(conversation, message, old)
+                }
+            }
             phone::Event::Conversation { conversation } => {
                 let before = self.unread();
                 if let Err(error) = self
@@ -835,7 +975,7 @@ impl Sync {
                 }
                 let mut out = self
                     .store
-                    .conversations_hidden(&[conversation])
+                    .conversations_hidden(std::slice::from_ref(&conversation))
                     .unwrap_or_default()
                     .iter()
                     .map(|c| {
@@ -853,6 +993,13 @@ impl Sync {
                 if self.unread() != before {
                     out.push(self.unread_event());
                 }
+                out.push(Self::event(
+                    "gone",
+                    &proto::GoneEvent {
+                        conversation,
+                        message: None,
+                    },
+                ));
                 out
             }
             phone::Event::Typing {
@@ -872,7 +1019,10 @@ impl Sync {
                 id,
                 conversation,
                 outcome,
-            } => self.sent(id, conversation, outcome),
+            } => {
+                self.sends.remove(&id);
+                self.sent(id, conversation, outcome)
+            }
             phone::Event::Expired { message } => {
                 self.lose_ready();
                 vec![Self::state(proto::State::Expired, Some(message))]
@@ -916,16 +1066,131 @@ impl Sync {
                     }]
                 }
             }
-            phone::Event::Done { .. }
-            | phone::Event::Contacts { .. }
-            | phone::Event::Started { .. } => {
-                tracing::debug!("stage-a phone event ignored");
-                Vec::new()
+            phone::Event::Done { id, error } => {
+                let Some(action) = self.actions.remove(&id) else {
+                    return Vec::new();
+                };
+                let forgotten = self.forgotten_actions.remove(&id);
+                if error.is_some() {
+                    eprintln!("phone action failed");
+                    return if forgotten {
+                        Vec::new()
+                    } else {
+                        vec![Self::reply(
+                            id,
+                            proto::ErrorCode::PhoneOffline,
+                            "the phone refused",
+                        )]
+                    };
+                }
+                let mut out = match action {
+                    Action::Archive(conversation) | Action::Restore(conversation) => {
+                        self.commands
+                            .send(phone::Command::Lookup(vec![conversation]));
+                        Vec::new()
+                    }
+                    Action::DeleteChat(conversation) => {
+                        self.handle(phone::Event::Gone { conversation })
+                    }
+                    Action::DeleteMessage {
+                        conversation,
+                        message,
+                    } => {
+                        self.deleted_messages.insert(message.clone());
+                        if self.store.forget_message(&message).is_err() {
+                            eprintln!("cannot forget message");
+                        }
+                        vec![Self::event(
+                            "gone",
+                            &proto::GoneEvent {
+                                conversation,
+                                message: Some(message),
+                            },
+                        )]
+                    }
+                    _ => Vec::new(),
+                };
+                if !forgotten {
+                    out.push(Self::ok(id, &serde_json::json!({})));
+                }
+                out
+            }
+            phone::Event::Contacts {
+                id,
+                contacts,
+                error,
+            } => {
+                let Some(Action::Contacts { offset, limit }) = self.actions.remove(&id) else {
+                    return Vec::new();
+                };
+                let forgotten = self.forgotten_actions.remove(&id);
+                if error.is_some() {
+                    eprintln!("phone contacts failed");
+                    return if forgotten {
+                        Vec::new()
+                    } else {
+                        vec![Self::reply(
+                            id,
+                            proto::ErrorCode::PhoneOffline,
+                            "the phone refused",
+                        )]
+                    };
+                }
+                self.contacts_cache = contacts
+                    .into_iter()
+                    .map(|c| proto::ContactDto {
+                        name: c.name,
+                        number: c.number,
+                    })
+                    .collect();
+                if forgotten {
+                    Vec::new()
+                } else {
+                    vec![Self::ok(id, &self.contacts_page(offset, limit))]
+                }
+            }
+            phone::Event::Started {
+                id,
+                conversation,
+                error,
+            } => {
+                if !matches!(self.actions.remove(&id), Some(Action::StartChat)) {
+                    return Vec::new();
+                }
+                let forgotten = self.forgotten_actions.remove(&id);
+                if error.is_some() || conversation.is_none() {
+                    eprintln!("phone start chat failed");
+                    return if forgotten {
+                        Vec::new()
+                    } else {
+                        vec![Self::reply(
+                            id,
+                            proto::ErrorCode::PhoneOffline,
+                            "the phone refused",
+                        )]
+                    };
+                }
+                let conversation = conversation.expect("checked above");
+                let name = conversation.id.clone();
+                let mut out = self.handle(phone::Event::Conversation { conversation });
+                if self
+                    .store
+                    .messages(&name)
+                    .map_or(true, |messages| messages.is_empty())
+                    || self.store.changed().is_ok_and(|ids| ids.contains(&name))
+                {
+                    self.fetch(vec![name.clone()]);
+                }
+                if !forgotten {
+                    out.push(Self::ok(id, &proto::StartChatData { conversation: name }));
+                }
+                out
             }
         }
     }
 
     pub fn send(&mut self, rid: u64, conversation: String, text: String, reply_to: Option<String>) {
+        self.sends.insert(rid);
         self.commands.send(phone::Command::Send {
             id: rid,
             conversation,
@@ -1578,6 +1843,289 @@ mod tests {
         });
         error(&out, proto::ErrorCode::NotPaired);
         assert_eq!(fs::read_dir(&sync.media_dir).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn action_done_updates_store_and_outlives_reply() {
+        let (mut sync, mut commands) = sync();
+        for (id, archive) in [(1, true), (2, false)] {
+            let p = proto::ConversationParams {
+                conversation: "c".into(),
+            };
+            if archive {
+                sync.archive(id, p)
+            } else {
+                sync.restore(id, p)
+            }
+            assert!(sync.busy());
+            assert!(matches!(
+                commands.try_recv().unwrap(),
+                phone::Command::Archive { .. } | phone::Command::Restore { .. }
+            ));
+            let out = sync.handle(phone::Event::Done { id, error: None });
+            assert!(matches!(&out[0], proto::Out::Reply { result: Ok(v), .. } if *v == json!({})));
+            assert!(
+                matches!(commands.try_recv().unwrap(), phone::Command::Lookup(ids) if ids == ["c"])
+            );
+        }
+        sync.delete_chat(
+            3,
+            proto::ConversationParams {
+                conversation: "c".into(),
+            },
+        );
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            phone::Command::DeleteChat { for_good: true, .. }
+        ));
+        sync.forget(3);
+        let out = sync.handle(phone::Event::Done { id: 3, error: None });
+        assert_eq!(data(&out, "gone")[0]["conversation"], "c");
+        assert!(
+            !out.iter()
+                .any(|out| matches!(out, proto::Out::Reply { .. }))
+        );
+        assert!(
+            sync.store
+                .conversation_list()
+                .unwrap()
+                .iter()
+                .any(|c| c.id == "c" && c.hidden)
+        );
+        assert!(!sync.busy());
+    }
+
+    #[test]
+    fn delete_chat_broadcasts_gone_and_send_counts_as_busy() {
+        let (mut sync, mut commands) = sync();
+        sync.delete_chat(
+            1,
+            proto::ConversationParams {
+                conversation: "c".into(),
+            },
+        );
+        commands.try_recv().unwrap();
+        let out = sync.handle(phone::Event::Done { id: 1, error: None });
+        assert_eq!(data(&out, "gone")[0]["conversation"], "c");
+        assert!(
+            matches!(out.last().unwrap(), proto::Out::Reply { result: Ok(v), .. } if *v == json!({}))
+        );
+        assert!(
+            sync.store
+                .conversation_list()
+                .unwrap()
+                .iter()
+                .any(|c| c.id == "c" && c.hidden)
+        );
+        sync.send(2, "c".into(), "hi".into(), None);
+        assert!(sync.busy());
+        commands.try_recv().unwrap();
+        sync.handle(phone::Event::Sent {
+            id: 2,
+            conversation: "c".into(),
+            outcome: phone::SendOutcome::Unavailable("offline".into()),
+        });
+        assert!(!sync.busy());
+    }
+
+    #[test]
+    fn delete_message_failure_and_reset() {
+        let (mut sync, mut commands) = sync();
+        sync.delete_message(
+            1,
+            proto::DeleteMessageParams {
+                conversation: "c".into(),
+                message: "stored".into(),
+            },
+        );
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            phone::Command::DeleteMessage { .. }
+        ));
+        let out = sync.handle(phone::Event::Done { id: 1, error: None });
+        assert_eq!(data(&out, "gone")[0]["message"], "stored");
+        assert!(sync.store.message("stored").unwrap().is_none());
+        sync.archive(
+            2,
+            proto::ConversationParams {
+                conversation: "c".into(),
+            },
+        );
+        let out = sync.handle(phone::Event::Done {
+            id: 2,
+            error: Some("SECRET".into()),
+        });
+        error(&out, proto::ErrorCode::PhoneOffline);
+        assert!(
+            matches!(&out[0], proto::Out::Reply { result: Err(e), .. } if e.message == "the phone refused")
+        );
+        sync.restore(
+            3,
+            proto::ConversationParams {
+                conversation: "c".into(),
+            },
+        );
+        let out = sync.handle(phone::Event::Paired);
+        error(&out, proto::ErrorCode::NotPaired);
+        assert!(!sync.busy());
+    }
+
+    #[test]
+    fn deleted_message_cannot_return_from_late_history_or_live_event() {
+        let (mut sync, mut commands) = sync();
+        sync.delete_message(
+            1,
+            proto::DeleteMessageParams {
+                conversation: "c".into(),
+                message: "stored".into(),
+            },
+        );
+        commands.try_recv().unwrap();
+        sync.handle(phone::Event::Done { id: 1, error: None });
+        let late = message("stored", 100, false, false);
+        let out = sync.handle(phone::Event::History {
+            conversation: "c".into(),
+            messages: vec![late.clone()],
+            error: None,
+        });
+        assert_eq!(data(&out, "history")[0]["messages"], json!([]));
+        assert!(sync.store.message("stored").unwrap().is_none());
+        assert!(
+            sync.handle(phone::Event::Message {
+                conversation: "c".into(),
+                message: late.clone(),
+                old: false,
+            })
+            .is_empty()
+        );
+        assert!(sync.store.message("stored").unwrap().is_none());
+        sync.handle(phone::Event::Paired);
+        sync.handle(phone::Event::History {
+            conversation: "c".into(),
+            messages: vec![late],
+            error: None,
+        });
+        assert!(sync.store.message("stored").unwrap().is_some());
+    }
+
+    #[test]
+    fn contacts_page_and_started_chat() {
+        let (mut sync, mut commands) = sync();
+        assert!(
+            sync.contacts(
+                1,
+                proto::ContactsParams {
+                    offset: 0,
+                    limit: 1
+                }
+            )
+            .is_empty()
+        );
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            phone::Command::Contacts { id: 1 }
+        ));
+        let out = sync.handle(phone::Event::Contacts {
+            id: 1,
+            contacts: vec![
+                phone::Contact {
+                    name: "Ann".into(),
+                    number: "123".into(),
+                },
+                phone::Contact {
+                    name: "Bea".into(),
+                    number: "456".into(),
+                },
+            ],
+            error: None,
+        });
+        assert!(
+            matches!(&out[0], proto::Out::Reply { result: Ok(v), .. } if v["total"] == 2 && v["items"][0]["name"] == "Ann")
+        );
+        let out = sync.contacts(
+            2,
+            proto::ContactsParams {
+                offset: 1,
+                limit: 1,
+            },
+        );
+        assert!(
+            matches!(&out[0], proto::Out::Reply { result: Ok(v), .. } if v["items"][0]["name"] == "Bea")
+        );
+        assert!(commands.try_recv().is_err());
+        sync.contacts(
+            3,
+            proto::ContactsParams {
+                offset: 0,
+                limit: 2,
+            },
+        );
+        commands.try_recv().unwrap();
+        let out = sync.handle(phone::Event::Contacts {
+            id: 3,
+            contacts: vec![],
+            error: Some("SECRET".into()),
+        });
+        error(&out, proto::ErrorCode::PhoneOffline);
+        sync.start_chat(
+            4,
+            proto::StartChatParams {
+                numbers: vec!["123".into()],
+            },
+        );
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            phone::Command::StartChat { id: 4, .. }
+        ));
+        let mut chat = conversation(false);
+        chat.id = "new".into();
+        let out = sync.handle(phone::Event::Started {
+            id: 4,
+            conversation: Some(chat),
+            error: None,
+        });
+        assert_eq!(data(&out, "conversation")[0]["conversation"]["id"], "new");
+        assert!(
+            matches!(out.last().unwrap(), proto::Out::Reply { result: Ok(v), .. } if v["conversation"] == "new")
+        );
+        sync.start_chat(
+            5,
+            proto::StartChatParams {
+                numbers: vec!["456".into()],
+            },
+        );
+        commands.try_recv().unwrap();
+        let out = sync.handle(phone::Event::Started {
+            id: 5,
+            conversation: None,
+            error: None,
+        });
+        error(&out, proto::ErrorCode::PhoneOffline);
+    }
+
+    #[test]
+    fn started_new_conversation_fetches_history() {
+        let (mut sync, mut commands) = sync();
+        sync.start_chat(
+            1,
+            proto::StartChatParams {
+                numbers: vec!["123".into()],
+            },
+        );
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            phone::Command::StartChat { id: 1, .. }
+        ));
+        let mut chat = conversation(false);
+        chat.id = "new".into();
+        sync.handle(phone::Event::Started {
+            id: 1,
+            conversation: Some(chat),
+            error: None,
+        });
+        assert!(
+            matches!(commands.try_recv().unwrap(), phone::Command::Fetch(ids) if ids == ["new"])
+        );
     }
 
     fn data(out: &[proto::Out], event: &str) -> Vec<Value> {

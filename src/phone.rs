@@ -418,7 +418,6 @@ impl Commands {
     }
 
     /// Commands going nowhere but to the receiver returned.
-    #[cfg(test)]
     pub fn detached() -> (Self, futures::channel::mpsc::UnboundedReceiver<Command>) {
         let (tx, rx) = futures::channel::mpsc::unbounded();
         (Commands(tx), rx)
@@ -1160,8 +1159,8 @@ async fn run_commands(state: Rc<State>, mut commands: UnboundedReceiver<Command>
                             .map_err(|e| e.to_string()),
                         Err(e) => Err(e),
                     };
-                    if let Err(e) = result {
-                        log::warn(&format!("cannot mark {conversation} read: {e}"));
+                    if result.is_err() {
+                        log::warn("cannot mark conversation read");
                     }
                 });
             }
@@ -1323,9 +1322,9 @@ async fn lookup(state: Rc<State>, ids: Vec<String>) {
     let Ok(client) = state.client() else { return };
     for id in ids {
         match client.get_conversation(&id).await {
-            Err(e) => log::warn(&format!("cannot look the conversation {id} up: {e}")),
+            Err(_) => log::warn("cannot look the conversation up"),
             Ok(c) if c.id.is_empty() || c.is_deleted() => {
-                tracing::debug!(conversation = %id, "conversation gone");
+                tracing::debug!("conversation gone");
                 state.emit(Event::Gone { conversation: id })
             }
             Ok(c) => {
@@ -1357,7 +1356,7 @@ async fn fetch(state: Rc<State>, ids: Vec<String>) {
                     Err(e) => Err(e),
                 };
                 if let Ok(page) = &listed {
-                    tracing::debug!(conversation = %id, fetched = page.messages.len(), "messages fetched");
+                    tracing::debug!(fetched = page.messages.len(), "messages fetched");
                 }
                 let event = match listed {
                     Ok(page) => Event::History {
@@ -1370,7 +1369,7 @@ async fn fetch(state: Rc<State>, ids: Vec<String>) {
                         error: None,
                     },
                     Err(error) => {
-                        log::warn(&format!("cannot fetch the messages of {id}: {error}"));
+                        log::warn("cannot fetch messages");
                         Event::History {
                             conversation: id,
                             messages: Vec::new(),
