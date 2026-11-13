@@ -333,6 +333,28 @@ which removes the whole race class. The rest is fixed point by point below.
 - **Step 1, `chat.start` reply:** `{conversation}` carries the conversation id. The full
   row arrives first, as the `conversation` event.
 
+- **Step 3, message delete:**
+  - `Delete` acts on the message under the pointer, if there is one, and otherwise on
+    the current conversation row. Thread has no message focus.
+  - The hovered message is cleared when the chat changes.
+- **Step 3, app menu:** "⋮" sits in a thin strip at the window's top, not an overlay,
+  because an overlay collides with the list header's buttons in single-column mode.
+- **Step 3, after unpair or uninstall:**
+  - The wait is 45 s, not 15 s: the old daemon's stop plus the new process's revoke (up
+    to 20 s) runs past 15 s.
+  - A request sent while the socket is already down shows the error instead of
+    "removed".
+  - `Client` gains `autoRetry` and `reconnect()`, so the window can stop retrying after
+    an uninstall.
+- **Step 3, review fixes** (Opus reviewer):
+  - a duplicate `onVisibleChanged`, which stopped `App.qml` loading;
+  - an "Unpairing…" overlay that never ended;
+  - a stale hovered message;
+  - two fallbacks on one I18n key, and the new-chat row string order;
+  - the un-dim timer for each attempt;
+  - keypad Enter;
+  - a chat hidden by the phone closes if it is the open one.
+
 ## Tests
 
 ```bash

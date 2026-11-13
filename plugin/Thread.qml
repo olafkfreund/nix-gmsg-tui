@@ -36,6 +36,10 @@ Item {
 
     signal backRequested()
     signal conversationRead(string id)
+    signal confirmRequested(string title, string body, string actionLabel, var action)
+
+    // The message under the pointer, for the Delete key.
+    property string hoveredMessage: ""
 
     property var messages: []
     property bool truncated: false
@@ -43,6 +47,7 @@ Item {
     property string typingPeer: ""
 
     onConversationIdChanged: {
+        root.hoveredMessage = "";
         root.typingPeer = "";
         root.readOwed = false;
         if (root.conversationId === "") {
@@ -170,6 +175,47 @@ Item {
         });
     }
 
+    function removeMessage(id) {
+        var next = [];
+        for (var i = 0; i < root.messages.length; i++) {
+            if (root.messages[i].id !== id) next.push(root.messages[i]);
+        }
+        if (next.length !== root.messages.length) root.messages = next;
+    }
+
+    function askDeleteMessage(id) {
+        var conv = root.conversationId;
+        if (id === "" || conv === "" || (root.ui["d:" + id] || ({})).busy) return;
+        root.confirmRequested(
+            I18n.t("gmessages.delete_message_title", "Delete message?"),
+            I18n.t("gmessages.delete_message_body", "This deletes the message for good."),
+            I18n.t("gmessages.delete", "Delete"),
+            function() {
+                var dk = "d:" + id;
+                root.setUi(dk, { busy: true });
+                root.client.send("delete.message", { conversation: conv, message: id }, function(r) {
+                    root.setUi(dk, null);
+                    if (r.ok) {
+                        if (root.conversationId === conv) root.removeMessage(id);
+                    } else {
+                        composer.statusNote = Errors.formatError(I18n, r.error);
+                    }
+                });
+            });
+    }
+
+    // True when a message was under the pointer (the key is then handled here).
+    function deleteHovered() {
+        if (root.hoveredMessage === "" || !root.visible || root.conversationId === "") return false;
+        for (var i = 0; i < root.messages.length; i++) {
+            if (root.messages[i].id === root.hoveredMessage) {
+                root.askDeleteMessage(root.hoveredMessage);
+                return true;
+            }
+        }
+        return false;
+    }
+
     function focusComposer() {
         composer.focusInput();
     }
@@ -207,6 +253,10 @@ Item {
                     root.readOwed = true;
                 }
             }
+        }
+
+        function onGone(conversation, message) {
+            if (conversation === root.conversationId && message !== "") root.removeMessage(message);
         }
 
         function onTyping(conversation, name, started) {
@@ -363,7 +413,13 @@ Item {
                     readonly property bool reactBusy: (root.ui["r:" + modelData.id] || ({})).busy === true
                     readonly property var reactions: Array.isArray(modelData.reactions) ? modelData.reactions : []
 
-                    HoverHandler { id: rowHover }
+                    HoverHandler {
+                        id: rowHover
+                        onHoveredChanged: {
+                            if (hovered) root.hoveredMessage = String(bubbleRow.modelData.id);
+                            else if (root.hoveredMessage === String(bubbleRow.modelData.id)) root.hoveredMessage = "";
+                        }
+                    }
 
                     // The picker overlay would cover the Open/Save rows, so it hides while one is hovered.
                     property bool attHover: false
@@ -658,6 +714,31 @@ Item {
                                         cursorShape: Qt.PointingHandCursor
                                         onClicked: root.react(bubbleRow.modelData, pick.modelData)
                                     }
+                                }
+                            }
+
+                            Rectangle {
+                                width: delText.implicitWidth + Style.space(10)
+                                height: delText.implicitHeight + Style.space(4)
+                                radius: height / 2
+                                color: Commons.Color.popups.background
+                                border.width: 1
+                                border.color: Commons.Color.urgent
+
+                                Text {
+                                    id: delText
+                                    anchors.centerIn: parent
+                                    textFormat: Text.PlainText
+                                    text: I18n.t("gmessages.delete", "Delete")
+                                    color: Commons.Color.urgent
+                                    font.family: root.theme.family
+                                    font.pixelSize: root.theme.caption
+                                }
+
+                                MouseArea {
+                                    anchors.fill: parent
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: root.askDeleteMessage(String(bubbleRow.modelData.id))
                                 }
                             }
                         }

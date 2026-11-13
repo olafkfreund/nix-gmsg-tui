@@ -13,12 +13,15 @@ Item {
     property var detail: null
     property int unread: 0
     property bool mismatch: false
+    // False after an uninstall: the daemon stays down until the next login.
+    property bool autoRetry: true
 
     signal pairing(var data)
     signal conversationChanged(var c)
     signal historyArrived(string conv, var msgs)
     signal messageArrived(string conv, var msg, bool notify)
     signal missed(int count)
+    signal gone(string conversation, string message)
     signal typing(string conversation, string name, bool started)
     signal avatarsArrived(var items)
     // After every handshake: state is re-read, so views reload what they missed.
@@ -66,7 +69,8 @@ Item {
         }
         root.seq += 1;
         var id = root.seq;
-        var ms = method === "send" ? 125000 : (method.indexOf("media.") === 0 ? 65000 : 20000);
+        var slow = ["contacts", "chat.start", "archive", "restore", "delete.chat", "delete.message", "unpair", "uninstall"];
+        var ms = method === "send" ? 125000 : (method.indexOf("media.") === 0 ? 65000 : (slow.indexOf(method) >= 0 ? 35000 : 20000));
         var t = timeoutTimer.createObject(root, { reqId: id, interval: ms, running: true });
         root.pending[id] = { cb: cb || null, timer: t };
         sock.write(JSON.stringify({ id: id, method: method, params: params || ({}) }) + "\n");
@@ -134,6 +138,9 @@ Item {
         case "avatars":
             root.avatarsArrived(d.items || ({}));
             break;
+        case "gone":
+            root.gone(String(d.conversation || ""), String(d.message || ""));
+            break;
         case "typing":
             root.typing(String(d.conversation || ""), String(d.name || ""), d.started === true);
             break;
@@ -174,9 +181,15 @@ Item {
                 root.clearPending("disconnected");
                 retry.interval = root.delay;
                 root.delay = Math.min(10000, root.delay * 2);
-                retry.restart();
+                if (root.autoRetry) retry.restart();
             }
         }
+    }
+
+    function reconnect() {
+        root.autoRetry = true;
+        root.delay = 500;
+        if (!sock.connected) retry.restart();
     }
 
     Timer {

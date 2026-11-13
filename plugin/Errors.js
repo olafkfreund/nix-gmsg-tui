@@ -30,7 +30,11 @@ var messages = {
     "keyring_locked": "Unlock your keyring",
     "keyring_refused": "The keyring refused to store the key.",
     "unpaired_remotely": "Unpaired from your phone.",
-    "cancelled": "Pairing cancelled."
+    "cancelled": "Pairing cancelled.",
+    "unpaired": "Phone unpaired.",
+    "unpaired_local": "Unpaired here. Google could not be told, so remove this device in the Messages app on your phone.",
+    "unpair_failed": "Could not remove the pairing file.",
+    "uninstall_failed": "Could not remove all data. Try again."
 };
 
 function format(I18n, code, fallback) {
