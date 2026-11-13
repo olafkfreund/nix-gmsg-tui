@@ -1323,9 +1323,9 @@ async fn lookup(state: Rc<State>, ids: Vec<String>) {
     let Ok(client) = state.client() else { return };
     for id in ids {
         match client.get_conversation(&id).await {
-            Err(e) => log::warn(&format!("cannot look the conversation {id} up: {e}")),
+            Err(_) => log::warn("cannot look the conversation up"),
             Ok(c) if c.id.is_empty() || c.is_deleted() => {
-                tracing::debug!(conversation = %id, "conversation gone");
+                tracing::debug!("conversation gone");
                 state.emit(Event::Gone { conversation: id })
             }
             Ok(c) => {

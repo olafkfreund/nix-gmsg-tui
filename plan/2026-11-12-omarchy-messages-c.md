@@ -323,6 +323,16 @@ which removes the whole race class. The rest is fixed point by point below.
         inactive;
       - `systemctl --user start gmessages-tui` gives `login` with a fresh store.
 
+## Deviations
+
+- **Step 1, `busy()`:**
+  - A send that timed out or disconnected stops counting as busy.
+  - A forgotten action still applies its effect, but stops counting as busy.
+  - Without this, a phone that never answers would block unpair and uninstall until
+    the next restart.
+- **Step 1, `chat.start` reply:** `{conversation}` carries the conversation id. The full
+  row arrives first, as the `conversation` event.
+
 ## Tests
 
 ```bash
