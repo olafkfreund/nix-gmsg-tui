@@ -1,5 +1,5 @@
 ---
-status: draft
+status: approved
 issue: none (issues are disabled on the fork)
 spec: spec/2026-11-11-omarchy-messages.md
 stage: c (contacts and new chats, archive, restore, delete, unpair, remove all data)
