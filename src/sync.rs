@@ -680,7 +680,6 @@ impl Sync {
         }
     }
 
-    #[allow(dead_code, reason = "used by the daemon in step 2")]
     pub fn busy(&self) -> bool {
         !self.sends.is_empty()
             || self
@@ -689,7 +688,6 @@ impl Sync {
                 .any(|rid| !self.forgotten_actions.contains(rid))
     }
 
-    #[allow(dead_code, reason = "used by the daemon in step 2")]
     pub fn contacts(&mut self, rid: u64, p: proto::ContactsParams) -> Vec<proto::Out> {
         if p.offset == 0 || self.contacts_cache.is_empty() {
             self.contacts_cache.clear();
@@ -720,7 +718,6 @@ impl Sync {
         }
     }
 
-    #[allow(dead_code, reason = "used by the daemon in step 2")]
     pub fn start_chat(&mut self, rid: u64, p: proto::StartChatParams) {
         self.actions.insert(rid, Action::StartChat);
         self.commands.send(phone::Command::StartChat {
@@ -729,7 +726,6 @@ impl Sync {
         });
     }
 
-    #[allow(dead_code, reason = "used by the daemon in step 2")]
     pub fn archive(&mut self, rid: u64, p: proto::ConversationParams) {
         self.actions
             .insert(rid, Action::Archive(p.conversation.clone()));
@@ -739,7 +735,6 @@ impl Sync {
         });
     }
 
-    #[allow(dead_code, reason = "used by the daemon in step 2")]
     pub fn restore(&mut self, rid: u64, p: proto::ConversationParams) {
         self.actions
             .insert(rid, Action::Restore(p.conversation.clone()));
@@ -749,7 +744,6 @@ impl Sync {
         });
     }
 
-    #[allow(dead_code, reason = "used by the daemon in step 2")]
     pub fn delete_chat(&mut self, rid: u64, p: proto::ConversationParams) {
         self.actions
             .insert(rid, Action::DeleteChat(p.conversation.clone()));
@@ -760,7 +754,6 @@ impl Sync {
         });
     }
 
-    #[allow(dead_code, reason = "used by the daemon in step 2")]
     pub fn delete_message(&mut self, rid: u64, p: proto::DeleteMessageParams) {
         self.actions.insert(
             rid,

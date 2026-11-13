@@ -49,6 +49,14 @@ impl Fixture {
         self.root.join("runtime/gmessages-tui/media")
     }
 
+    fn data(&self) -> std::path::PathBuf {
+        self.root.join("data/gmessages-tui")
+    }
+
+    fn cache(&self) -> std::path::PathBuf {
+        self.root.join("cache/gmessages-tui")
+    }
+
     fn start(&mut self) {
         self.child = Some(self.command().spawn().unwrap());
         let until = Instant::now() + Duration::from_secs(5);
@@ -76,14 +84,14 @@ impl Fixture {
     }
 
     fn wait(&mut self) {
-        let until = Instant::now() + Duration::from_secs(5);
+        let until = Instant::now() + Duration::from_secs(10);
         loop {
             if self.child.as_mut().unwrap().try_wait().unwrap().is_some() {
                 return;
             }
             assert!(
                 Instant::now() < until,
-                "daemon did not exit within five seconds"
+                "daemon did not exit within ten seconds"
             );
             thread::sleep(Duration::from_millis(20));
         }
@@ -149,6 +157,14 @@ impl Client {
             self.request(0, "hello", json!({"protocol": 1, "role": "app"}))["ok"],
             true
         );
+    }
+
+    fn wait_state(&mut self, wanted: &str) {
+        let until = Instant::now() + Duration::from_secs(5);
+        while self.request(99, "state", json!({}))["data"]["state"] != wanted {
+            assert!(Instant::now() < until, "daemon did not reach {wanted}");
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 }
 
@@ -222,4 +238,108 @@ fn one_instance_stale_socket_and_sigterm_cleanup() {
     fixture.wait();
     assert!(!fixture.socket().exists());
     assert_eq!(fs::read_dir(fixture.media()).unwrap().count(), 0);
+}
+
+#[test]
+fn stage_c_actions_and_unpair_need_a_phone() {
+    let mut fixture = Fixture::new();
+    fixture.start();
+    let mut client = fixture.connect();
+    client.hello();
+    client.wait_state("login");
+    for (id, method, params) in [
+        (1, "contacts", json!({"offset":0,"limit":200})),
+        (2, "chat.start", json!({"numbers":["123"]})),
+        (3, "archive", json!({"conversation":"c"})),
+        (4, "restore", json!({"conversation":"c"})),
+        (5, "delete.chat", json!({"conversation":"c"})),
+        (
+            6,
+            "delete.message",
+            json!({"conversation":"c","message":"m"}),
+        ),
+        (7, "unpair", json!({})),
+    ] {
+        assert_eq!(
+            client.request(id, method, params)["error"]["code"],
+            "not_paired",
+            "{method}"
+        );
+    }
+}
+
+#[test]
+fn uninstall_reexecs_and_removes_data_in_login_and_unreadable_store() {
+    for unreadable in [false, true] {
+        let mut fixture = Fixture::new();
+        if unreadable {
+            fs::create_dir_all(fixture.data()).unwrap();
+            fs::write(fixture.data().join("messages.db"), b"garbage").unwrap();
+        }
+        fs::create_dir_all(fixture.cache()).unwrap();
+        fs::write(fixture.cache().join("old"), b"old").unwrap();
+        fixture.start();
+        let mut client = fixture.connect();
+        client.hello();
+        client.wait_state(if unreadable {
+            "store_unreadable"
+        } else {
+            "login"
+        });
+        assert_eq!(client.request(1, "uninstall", json!({}))["data"], json!({}));
+        fixture.wait();
+        assert!(!fixture.socket().exists());
+        assert!(!fixture.cache().exists());
+        let names: Vec<_> = fs::read_dir(fixture.data())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["lock"]);
+    }
+}
+
+#[test]
+fn unpair_keeps_store_and_reports_local_removal() {
+    let mut fixture = Fixture::new();
+    fs::create_dir_all(fixture.data()).unwrap();
+    fs::write(fixture.data().join("session.json"), b"invalid session").unwrap();
+    fs::write(fixture.data().join("pending-unpair"), b"").unwrap();
+    fixture.start();
+    let mut client = fixture.connect();
+    client.hello();
+    client.wait_state("login");
+    assert_eq!(
+        client.request(1, "state", json!({}))["data"]["detail"],
+        "unpaired_local"
+    );
+    assert!(fixture.data().join("messages.db").exists());
+    assert!(!fixture.data().join("session.json").exists());
+    assert!(!fixture.data().join("pending-unpair").exists());
+}
+
+#[test]
+fn failed_uninstall_stays_fatal_and_retries() {
+    let mut fixture = Fixture::new();
+    fs::create_dir_all(fixture.data()).unwrap();
+    fs::write(fixture.data().join("lock"), b"").unwrap();
+    fs::write(fixture.data().join("pending-uninstall"), b"").unwrap();
+    fs::write(fixture.data().join("messages.db"), b"garbage").unwrap();
+    fs::set_permissions(fixture.data(), fs::Permissions::from_mode(0o500)).unwrap();
+    fixture.start();
+    let mut client = fixture.connect();
+    client.hello();
+    client.wait_state("fatal");
+    assert_eq!(
+        client.request(1, "state", json!({}))["data"]["detail"],
+        "uninstall_failed"
+    );
+    assert!(fixture.data().join("pending-uninstall").exists());
+    assert_eq!(
+        client.request(2, "key.retry", json!({}))["error"]["code"],
+        "not_paired"
+    );
+    fs::set_permissions(fixture.data(), fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(client.request(3, "uninstall", json!({}))["data"], json!({}));
+    fixture.wait();
+    assert!(!fixture.data().join("pending-uninstall").exists());
 }
