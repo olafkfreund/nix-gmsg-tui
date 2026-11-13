@@ -43,6 +43,9 @@ Item {
         return res;
     }
 
+    Keys.onTabPressed: function(event) { filterField.forceActiveFocus(); event.accepted = true; }
+    Keys.onBacktabPressed: function(event) { filterField.forceActiveFocus(); event.accepted = true; }
+
     onRowsChanged: root.currentIndex = Math.min(root.currentIndex, Math.max(0, root.rows.length - 1))
 
     onOpenChanged: {
@@ -154,6 +157,9 @@ Item {
                     root.move(1);
                     event.accepted = true;
                 }
+                // Only focusable item in the modal: keep focus here.
+                Keys.onTabPressed: function(event) { event.accepted = true; }
+                Keys.onBacktabPressed: function(event) { event.accepted = true; }
                 Keys.onUpPressed: function(event) {
                     root.move(-1);
                     event.accepted = true;

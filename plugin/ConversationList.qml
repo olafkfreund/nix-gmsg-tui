@@ -24,7 +24,7 @@ Item {
     signal newChatRequested()
     signal confirmRequested(string title, string body, string actionLabel, var action)
 
-    // "inbox" or "archived"; a page that comes back for another folder or generation is dropped.
+    // "inbox" or "archive" (the daemon's folder name); a page that comes back for another folder or generation is dropped.
     property string folder: "inbox"
     property int gen: 0
     property string status: ""
@@ -33,6 +33,8 @@ Item {
     property int attempts: 0
 
     property var allItems: []
+    // Ids removed or moved away since the last reload; a later page must not bring them back.
+    property var goneIds: ({})
     // Conversation id to picture path; replaced whole on each change.
     property var avatars: ({})
     readonly property var selectedItem: {
@@ -92,6 +94,7 @@ Item {
     function reload() {
         if (!root.client.connected || root.client.state !== "ready") return;
         root.loading = true;
+        root.goneIds = ({});
         root.gen += 1;
         root.fetchPage(0, [], root.gen);
     }
@@ -107,7 +110,7 @@ Item {
             var total = Number(r.data.total) || 0;
             root.totalCount = total;
             root.noteAvatars(items);
-            var merged = acc.concat(items);
+            var merged = acc.concat(items).filter(function(c) { return !(c.id in root.goneIds); });
             merged.sort(function(a, b) { return (Number(b.last_ms) || 0) - (Number(a.last_ms) || 0); });
             root.allItems = merged;
             if (offset + items.length < total && items.length === 200) {
@@ -124,6 +127,7 @@ Item {
         root.noteAvatars([c]);
         root.setBusy(c.id, false);
         var here = !c.hidden && (c.folder || "inbox") === root.folder;
+        if (here) delete root.goneIds[c.id]; else root.goneIds[c.id] = true;
         if (c.hidden && c.id === root.selectedId) root.conversationHidden(c.id);
         var next = [];
         var found = false;
@@ -177,6 +181,7 @@ Item {
 
     function removeConversation(id) {
         root.setBusy(id, false);
+        root.goneIds[id] = true;
         var next = [];
         for (var i = 0; i < root.allItems.length; i++) {
             if (root.allItems[i].id !== id) next.push(root.allItems[i]);
@@ -249,7 +254,7 @@ Item {
     }
 
     function toggleFolder() {
-        root.setFolder(root.folder === "inbox" ? "archived" : "inbox");
+        root.setFolder(root.folder === "inbox" ? "archive" : "inbox");
     }
 
     // Opened before the list loaded (from a notification): give the thread its name now.
@@ -512,7 +517,7 @@ Item {
             Repeater {
                 model: [
                     { folder: "inbox", label: I18n.t("gmessages.folder_inbox", "Inbox") },
-                    { folder: "archived", label: I18n.t("gmessages.folder_archived", "Archived") }
+                    { folder: "archive", label: I18n.t("gmessages.folder_archived", "Archived") }
                 ]
 
                 Rectangle {
@@ -726,7 +731,7 @@ Item {
                 textFormat: Text.PlainText
                 text: root.loading
                     ? I18n.t("gmessages.loading_conversations", "Loading conversations…")
-                    : (root.folder === "archived"
+                    : (root.folder === "archive"
                         ? I18n.t("gmessages.no_archived", "No archived conversations")
                         : I18n.t("gmessages.no_conversations", "No conversations"))
                 color: Commons.Color.muted

@@ -368,6 +368,15 @@ which removes the whole race class. The rest is fixed point by point below.
   - the un-dim timer for each attempt;
   - keypad Enter;
   - a chat hidden by the phone closes if it is the open one.
+- **Step 3, review fixes** (Codex, Opus and agy diff reviews):
+  - The archive folder is `"archive"`, the daemon's name, not `"archived"`.
+  - A later page can't bring back a chat that was removed or moved since the reload.
+  - Tab stays inside the confirm and new-chat dialogs, and the composer is off while a
+    dialog or a lifecycle overlay is open.
+  - After "removed", reopening the window keeps that view and doesn't reconnect. A Retry
+    error shows in the `uninstall_failed` overlay.
+  - The Delete key and the button share one rule for which messages can be deleted. Over
+    one that can't, the key does nothing, rather than offering to delete the chat.
 
 ## Tests
 

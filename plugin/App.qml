@@ -39,7 +39,7 @@ FloatingWindow {
     property var confirmAction: null
     property bool newChatOpen: false
     property bool menuOpen: false
-    readonly property bool modal: root.confirmOpen || root.newChatOpen
+    readonly property bool modal: root.confirmOpen || root.newChatOpen || root.lifecycle !== "" || root.uninstallFailed
 
     // "" | "unpairing" | "removing" | "removed": the daemon restarts itself for both.
     property string lifecycle: ""
@@ -148,10 +148,6 @@ FloatingWindow {
 
     onVisibleChanged: {
         root.syncFocus();
-        if (root.visible && root.lifecycle === "removed") {
-            root.lifecycle = "";
-            appClient.reconnect();
-        }
     }
     onReadyChanged: {
         if (!root.ready) root.newChatOpen = false;
@@ -459,6 +455,7 @@ FloatingWindow {
                         client: appClient
                         theme: appTheme
                         compact: !root.twoColumns
+                        modal: root.modal
                         focused: root.visible && root.windowActive
                         conversationId: root.activeConversation
                         conversationName: root.activeConversationName
@@ -509,6 +506,18 @@ FloatingWindow {
                     color: root.lifecycle === "" ? Commons.Color.urgent : Commons.Color.foreground
                     font.family: appTheme.family
                     font.pixelSize: appTheme.body
+                }
+
+                Text {
+                    visible: root.lifecycle === "" && root.note !== ""
+                    Layout.fillWidth: true
+                    textFormat: Text.PlainText
+                    wrapMode: Text.Wrap
+                    horizontalAlignment: Text.AlignHCenter
+                    text: root.note
+                    color: Commons.Color.urgent
+                    font.family: appTheme.family
+                    font.pixelSize: appTheme.caption
                 }
 
                 Rectangle {

@@ -40,6 +40,13 @@ Item {
 
     // The message under the pointer, for the Delete key.
     property string hoveredMessage: ""
+    // A modal layer is open: the composer must not take keys.
+    property bool modal: false
+
+    // Messages that can be reacted to or deleted (the one rule for the buttons and the Delete key).
+    function reactable(m) {
+        return m.deleted !== true && m.failed !== true && m.pending !== true;
+    }
 
     property var messages: []
     property bool truncated: false
@@ -209,6 +216,8 @@ Item {
         if (root.hoveredMessage === "" || !root.visible || root.conversationId === "") return false;
         for (var i = 0; i < root.messages.length; i++) {
             if (root.messages[i].id === root.hoveredMessage) {
+                // Swallow the key: falling through would offer to delete the whole chat.
+                if (!root.reactable(root.messages[i])) return true;
                 root.askDeleteMessage(root.hoveredMessage);
                 return true;
             }
@@ -409,7 +418,7 @@ Item {
                     readonly property bool isDeleted: modelData.deleted === true
                     readonly property bool isFailed: modelData.failed === true
                     readonly property bool isPending: modelData.pending === true
-                    readonly property bool reactable: !isDeleted && !isFailed && !isPending
+                    readonly property bool reactable: root.reactable(modelData)
                     readonly property bool reactBusy: (root.ui["r:" + modelData.id] || ({})).busy === true
                     readonly property var reactions: Array.isArray(modelData.reactions) ? modelData.reactions : []
 
@@ -768,6 +777,7 @@ Item {
 
         Composer {
             id: composer
+            enabled: !root.modal
             visible: root.conversationId !== ""
             Layout.fillWidth: true
             client: root.client

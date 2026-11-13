@@ -29,6 +29,10 @@ Item {
         event.accepted = true;
     }
 
+    // Tab and Backtab cycle the two buttons and never leave the modal.
+    Keys.onTabPressed: function(event) { cancelBtn.forceActiveFocus(); event.accepted = true; }
+    Keys.onBacktabPressed: function(event) { okBtn.forceActiveFocus(); event.accepted = true; }
+
     component Btn: Rectangle {
         id: btn
         property string label: ""
@@ -128,6 +132,7 @@ Item {
                     label: I18n.t("gmessages.cancel", "Cancel")
                     KeyNavigation.right: okBtn
                     KeyNavigation.tab: okBtn
+                    KeyNavigation.backtab: okBtn
                     onPressed: root.cancelled()
                 }
 
@@ -138,6 +143,7 @@ Item {
                     ink: Commons.Color.background
                     KeyNavigation.left: cancelBtn
                     KeyNavigation.tab: cancelBtn
+                    KeyNavigation.backtab: cancelBtn
                     onPressed: root.accepted()
                 }
             }
