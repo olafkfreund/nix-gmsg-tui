@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -83,11 +83,11 @@ impl Fixture {
         }
     }
 
-    fn wait(&mut self) {
+    fn wait(&mut self) -> std::process::ExitStatus {
         let until = Instant::now() + Duration::from_secs(10);
         loop {
-            if self.child.as_mut().unwrap().try_wait().unwrap().is_some() {
-                return;
+            if let Some(status) = self.child.as_mut().unwrap().try_wait().unwrap() {
+                return status;
             }
             assert!(
                 Instant::now() < until,
@@ -229,13 +229,13 @@ fn one_instance_stale_socket_and_sigterm_cleanup() {
     assert!(String::from_utf8_lossy(&second.stderr).contains("already running"));
 
     fixture.signal(libc::SIGKILL);
-    fixture.wait();
+    let _ = fixture.wait();
     assert!(fixture.socket().exists());
     fixture.start();
     fixture.connect().hello();
     fs::write(fixture.media().join("old"), b"old").unwrap();
     fixture.signal(libc::SIGTERM);
-    fixture.wait();
+    assert!(fixture.wait().success());
     assert!(!fixture.socket().exists());
     assert_eq!(fs::read_dir(fixture.media()).unwrap().count(), 0);
 }
@@ -287,7 +287,7 @@ fn uninstall_reexecs_and_removes_data_in_login_and_unreadable_store() {
             "login"
         });
         assert_eq!(client.request(1, "uninstall", json!({}))["data"], json!({}));
-        fixture.wait();
+        assert!(fixture.wait().success());
         assert!(!fixture.socket().exists());
         assert!(!fixture.cache().exists());
         let names: Vec<_> = fs::read_dir(fixture.data())
@@ -303,8 +303,25 @@ fn unpair_keeps_store_and_reports_local_removal() {
     let mut fixture = Fixture::new();
     fs::create_dir_all(fixture.data()).unwrap();
     fs::write(fixture.data().join("session.json"), b"invalid session").unwrap();
-    fs::write(fixture.data().join("pending-unpair"), b"").unwrap();
     fixture.start();
+    let mut client = fixture.connect();
+    client.hello();
+    client.wait_state("fatal");
+    assert_eq!(
+        client.request(2, "pair.cancel", json!({}))["data"],
+        json!({})
+    );
+    let inode = fs::metadata(fixture.data().join("messages.db"))
+        .unwrap()
+        .ino();
+    assert_eq!(client.request(3, "unpair", json!({}))["data"], json!({}));
+    let until = Instant::now() + Duration::from_secs(5);
+    while fixture.data().join("session.json").exists()
+        || fixture.data().join("pending-unpair").exists()
+    {
+        assert!(Instant::now() < until, "unpair did not finish");
+        thread::sleep(Duration::from_millis(20));
+    }
     let mut client = fixture.connect();
     client.hello();
     client.wait_state("login");
@@ -313,8 +330,34 @@ fn unpair_keeps_store_and_reports_local_removal() {
         "unpaired_local"
     );
     assert!(fixture.data().join("messages.db").exists());
+    assert_eq!(
+        fs::metadata(fixture.data().join("messages.db"))
+            .unwrap()
+            .ino(),
+        inode
+    );
     assert!(!fixture.data().join("session.json").exists());
     assert!(!fixture.data().join("pending-unpair").exists());
+}
+
+#[test]
+fn failed_unpair_with_session_stays_in_login_for_retry() {
+    let mut fixture = Fixture::new();
+    fs::create_dir_all(fixture.data().join("session.json")).unwrap();
+    fs::write(fixture.data().join("pending-unpair"), b"").unwrap();
+    fixture.start();
+    let mut client = fixture.connect();
+    client.hello();
+    client.wait_state("login");
+    assert_eq!(
+        client.request(1, "state", json!({}))["data"]["detail"],
+        "unpair_failed"
+    );
+    assert_eq!(
+        client.request(4, "pair.start", json!({"method":"qr"}))["error"]["code"],
+        "not_paired"
+    );
+    assert_eq!(client.request(2, "unpair", json!({}))["data"], json!({}));
 }
 
 #[test]
@@ -340,6 +383,6 @@ fn failed_uninstall_stays_fatal_and_retries() {
     );
     fs::set_permissions(fixture.data(), fs::Permissions::from_mode(0o700)).unwrap();
     assert_eq!(client.request(3, "uninstall", json!({}))["data"], json!({}));
-    fixture.wait();
+    assert!(fixture.wait().success());
     assert!(!fixture.data().join("pending-uninstall").exists());
 }

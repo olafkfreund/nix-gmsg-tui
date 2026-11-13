@@ -4,8 +4,8 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -72,6 +72,8 @@ struct Daemon {
     next_rid: u64,
     state: proto::State,
     detail: Option<String>,
+    startup_detail: Option<String>,
+    uninstall_failed: bool,
     sync: Option<sync::Sync>,
     commands: Option<phone::Commands>,
     control: Option<phone::Control>,
@@ -98,42 +100,87 @@ pub fn run() -> ExitCode {
         }
     };
     let result = tokio::task::LocalSet::new().block_on(&runtime, serve());
-    if let Ok(true) = result {
-        let exe = match std::env::current_exe() {
-            Ok(exe) => exe,
-            Err(error) => {
-                eprintln!("cannot find daemon executable: {error}");
+    let code = match result {
+        Ok((true, lock)) => {
+            let exe = match std::env::current_exe() {
+                Ok(exe) => exe,
+                Err(error) => {
+                    eprintln!("cannot find daemon executable: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let fd = lock.as_raw_fd();
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0
+            {
+                eprintln!("cannot transfer daemon lock");
                 return ExitCode::FAILURE;
             }
-        };
-        eprintln!("daemon restarting for pending action");
-        let error = Command::new(exe).arg("serve").exec();
-        eprintln!("cannot restart daemon: {error}");
-        return ExitCode::FAILURE;
-    }
-    if let Err(error) = result {
-        eprintln!("{error}");
-        if error.kind() == io::ErrorKind::AlreadyExists {
-            ExitCode::from(ALREADY_RUNNING)
-        } else {
+            let error = Command::new(exe)
+                .arg("serve")
+                .env("GMESSAGES_TUI_LOCK_FD", fd.to_string())
+                .exec();
+            eprintln!("cannot restart daemon: {error}");
             ExitCode::FAILURE
         }
-    } else {
-        ExitCode::SUCCESS
-    }
+        Ok((false, _lock)) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{error}");
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                ExitCode::from(ALREADY_RUNNING)
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+    };
+    // A keyring call stuck on an unlock prompt must not hold the exit.
+    runtime.shutdown_timeout(Duration::from_secs(1));
+    code
 }
 
-async fn serve() -> io::Result<bool> {
+async fn serve() -> io::Result<(bool, File)> {
     let data = paths::data()?;
     let cache = paths::cache()?;
     let runtime = paths::runtime()?;
     paths::create_private_dir(&data)?;
     paths::create_private_dir(&runtime)?;
     std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))?;
-    let _lock = lock(&data.join("lock"))?;
-    let startup = startup_action(&data, &cache).await;
+    let lock = lock(&data.join("lock"))?;
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let (startup, signaled) = {
+        let action = startup_action(&data, &cache);
+        tokio::pin!(action);
+        tokio::select! {
+            startup = &mut action => (startup, false),
+            _ = term.recv() => (action.await, true),
+            _ = interrupt.recv() => (action.await, true),
+        }
+    };
+    let signaled = signaled || signal_pending(&mut term, &mut interrupt);
+    if signaled {
+        return Ok((false, lock));
+    }
+    let startup = match startup {
+        Startup::Uninstalled => match std::fs::remove_file(data.join("pending-uninstall")) {
+            Ok(()) => Startup::Uninstalled,
+            Err(_) => {
+                eprintln!("cannot remove uninstall marker");
+                Startup::Fatal
+            }
+        },
+        Startup::Normal(Some(detail)) => {
+            if std::fs::remove_file(data.join("pending-unpair")).is_err() {
+                eprintln!("cannot remove unpair marker");
+                Startup::Normal(Some("unpair_failed".into()))
+            } else {
+                Startup::Normal(Some(detail))
+            }
+        }
+        other => other,
+    };
     if matches!(startup, Startup::Uninstalled) {
-        return Ok(false);
+        return Ok((false, lock));
     }
     if !matches!(startup, Startup::Fatal) {
         std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700))?;
@@ -150,11 +197,28 @@ async fn serve() -> io::Result<bool> {
     }
     let listener = UnixListener::bind(&socket)?;
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
-    let result = serve_bound(listener, data, &media, avatars.clone(), startup).await;
+    let result = serve_bound(
+        listener,
+        data,
+        &media,
+        avatars.clone(),
+        startup,
+        term,
+        interrupt,
+    )
+    .await;
     let _ = std::fs::remove_file(&socket);
     let _ = clear_media(&media);
     let _ = clear_media(&avatars);
-    result
+    result.map(|restart| (restart, lock))
+}
+
+fn signal_pending(
+    term: &mut tokio::signal::unix::Signal,
+    interrupt: &mut tokio::signal::unix::Signal,
+) -> bool {
+    let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+    term.poll_recv(&mut cx).is_ready() || interrupt.poll_recv(&mut cx).is_ready()
 }
 
 async fn serve_bound(
@@ -163,27 +227,31 @@ async fn serve_bound(
     media: &Path,
     avatar_dir: PathBuf,
     startup: Startup,
+    mut term: tokio::signal::unix::Signal,
+    mut interrupt: tokio::signal::unix::Signal,
 ) -> io::Result<bool> {
     if !matches!(startup, Startup::Fatal) {
         trim_log(&data.join("phone.log"))?;
         phone::log::init(&data.join("phone.log"));
     }
     let (tx, mut rx) = mpsc::channel(QUEUE);
+    let uninstall_failed = matches!(startup, Startup::Fatal);
     let mut daemon = Daemon {
         clients: HashMap::new(),
         pending: HashMap::new(),
         next_conn: 1,
         next_rid: 1,
-        state: if matches!(startup, Startup::Fatal) {
+        state: if uninstall_failed {
             proto::State::Fatal
         } else {
             proto::State::Starting
         },
-        detail: match startup {
+        detail: uninstall_failed.then(|| "uninstall_failed".into()),
+        startup_detail: match startup {
             Startup::Normal(detail) => detail,
-            Startup::Fatal => Some("uninstall_failed".into()),
-            Startup::Uninstalled => None,
+            _ => None,
         },
+        uninstall_failed,
         sync: None,
         commands: None,
         control: None,
@@ -197,7 +265,7 @@ async fn serve_bound(
         tx,
         reexec: false,
     };
-    if daemon.state != proto::State::Fatal {
+    if !daemon.uninstall_failed {
         daemon.start_key();
     }
     let mut retry = tokio::time::interval_at(
@@ -205,8 +273,7 @@ async fn serve_bound(
         Duration::from_secs(30),
     );
     let mut deadlines = tokio::time::interval(Duration::from_millis(100));
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let mut signaled = false;
     loop {
         tokio::select! {
             accepted = listener.accept() => match accepted {
@@ -231,12 +298,12 @@ async fn serve_bound(
                 if matches!(daemon.state, proto::State::Locked | proto::State::KeyringMissing) { daemon.start_key(); }
             }
             _ = deadlines.tick() => daemon.expire(),
-            _ = term.recv() => break,
-            _ = interrupt.recv() => break,
+            _ = term.recv() => { signaled = true; break },
+            _ = interrupt.recv() => { signaled = true; break },
         }
     }
     if daemon.reexec {
-        daemon.flush_clients().await;
+        signaled |= finish_or_signal(daemon.flush_clients(), &mut term, &mut interrupt).await;
     }
     if let Some(pairing) = daemon.pairing.take() {
         pairing.abort();
@@ -244,9 +311,29 @@ async fn serve_bound(
     daemon.pair_status = None;
     daemon.clients.clear();
     if let Some(control) = daemon.control.take() {
-        let _ = timeout(Duration::from_secs(4), control.stop()).await;
+        let stop = async {
+            let _ = timeout(Duration::from_secs(4), control.stop()).await;
+        };
+        if daemon.reexec {
+            signaled |= finish_or_signal(stop, &mut term, &mut interrupt).await;
+        } else {
+            stop.await;
+        }
     }
-    Ok(daemon.reexec)
+    Ok(daemon.reexec && !signaled && !signal_pending(&mut term, &mut interrupt))
+}
+
+async fn finish_or_signal<F: std::future::Future<Output = ()>>(
+    future: F,
+    term: &mut tokio::signal::unix::Signal,
+    interrupt: &mut tokio::signal::unix::Signal,
+) -> bool {
+    tokio::pin!(future);
+    tokio::select! {
+        _ = &mut future => false,
+        _ = term.recv() => { future.await; true },
+        _ = interrupt.recv() => { future.await; true },
+    }
 }
 
 enum Startup {
@@ -284,13 +371,22 @@ async fn startup_action(data: &Path, cache: &Path) -> Startup {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => (),
                 Err(error) => return Err(error),
             }
-            if std::env::var_os("GMESSAGES_TUI_PASSPHRASE").is_some() {
+            if key::passphrase().is_some() {
                 eprintln!("uninstall: keyring skipped for passphrase store");
             } else {
-                key::forget(&data.join("messages.db"))
-                    .map_err(|_| io::Error::other("cannot remove store key"))?;
+                let db = data.join("messages.db");
+                let forgotten = timeout(
+                    Duration::from_secs(10),
+                    tokio::task::spawn_blocking(move || {
+                        key::forget(&db).map_err(|_| io::Error::other("cannot remove store key"))
+                    }),
+                )
+                .await;
+                match forgotten {
+                    Ok(Ok(Ok(()))) => (),
+                    _ => return Err(io::Error::other("cannot remove store key")),
+                }
             }
-            std::fs::remove_file(&uninstall)?;
             Ok::<(), io::Error>(())
         }
         .await;
@@ -312,10 +408,6 @@ async fn startup_action(data: &Path, cache: &Path) -> Startup {
                 "unpair_failed"
             }
         };
-        if std::fs::remove_file(unpair).is_err() {
-            eprintln!("cannot remove unpair marker");
-            return Startup::Normal(Some("unpair_failed".into()));
-        }
         return Startup::Normal(Some(detail.into()));
     }
     Startup::Normal(None)
@@ -419,6 +511,19 @@ impl Daemon {
         match store::Store::open(&self.data.join("messages.db"), &key) {
             Ok(store) => {
                 let session = self.data.join("session.json");
+                if self.startup_detail.as_deref() == Some("unpair_failed") && session.exists() {
+                    let (commands, _unused) = phone::Commands::detached();
+                    self.sync = Some(sync::Sync::new(
+                        Rc::new(store),
+                        commands,
+                        self.avatar_dir.clone(),
+                        self.media_dir.clone(),
+                        self.downloads.clone(),
+                    ));
+                    let detail = self.startup_detail.take();
+                    self.set_state(proto::State::Login, detail);
+                    return;
+                }
                 // Paired before: connecting, so the plugin does not flash "sign in".
                 let state = if session.exists() {
                     proto::State::Connecting
@@ -436,7 +541,7 @@ impl Daemon {
                 ));
                 self.commands = Some(commands);
                 self.control = Some(control);
-                let detail = self.detail.take();
+                let detail = self.startup_detail.take();
                 self.set_state(state, detail);
                 let tx = self.tx.clone();
                 tokio::task::spawn_local(async move {
@@ -638,10 +743,7 @@ impl Daemon {
             Incoming::Phone(event) => {
                 if matches!(event, phone::Event::Login)
                     && self.state == proto::State::Login
-                    && self
-                        .detail
-                        .as_deref()
-                        .is_some_and(|detail| detail.starts_with("unpaired"))
+                    && matches!(self.detail.as_deref(), Some("unpaired" | "unpaired_local"))
                 {
                     return;
                 }
@@ -773,9 +875,7 @@ impl Daemon {
             self.write(conn, &proto::Reply::bad_request("id required"));
             return;
         };
-        if self.state == proto::State::Fatal
-            && !matches!(request.method.as_str(), "state" | "uninstall")
-        {
+        if self.uninstall_failed && !matches!(request.method.as_str(), "state" | "uninstall") {
             self.write(conn, &self.unready(Some(id)));
             return;
         }
@@ -785,6 +885,10 @@ impl Daemon {
                 "state" | "key.retry" | "pair.cancel" | "uninstall"
             )
         {
+            self.write(conn, &self.unready(Some(id)));
+            return;
+        }
+        if request.method == "pair.start" && self.control.is_none() {
             self.write(conn, &self.unready(Some(id)));
             return;
         }
@@ -1208,6 +1312,9 @@ fn params<T: DeserializeOwned>(value: Value) -> Result<T, String> {
 }
 
 fn lock(path: &Path) -> io::Result<File> {
+    if let Some(file) = inherited_lock(path) {
+        return Ok(file);
+    }
     let mut file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -1235,6 +1342,31 @@ fn lock(path: &Path) -> io::Result<File> {
     file.write_all(std::process::id().to_string().as_bytes())?;
     file.sync_data()?;
     Ok(file)
+}
+
+fn inherited_lock(path: &Path) -> Option<File> {
+    let inherited = std::env::var("GMESSAGES_TUI_LOCK_FD").ok();
+    // The marker only belongs to this exec; ordinary starts must never inherit it.
+    unsafe { std::env::remove_var("GMESSAGES_TUI_LOCK_FD") };
+    let fd = inherited?.parse::<i32>().ok()?;
+    if fd < 0 {
+        return None;
+    }
+    let copy = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+    if copy < 0 {
+        return None;
+    }
+    let file = unsafe { File::from_raw_fd(copy) };
+    let original = file.metadata().ok()?;
+    let target = std::fs::metadata(path).ok()?;
+    if original.dev() != target.dev() || original.ino() != target.ino() {
+        return None;
+    }
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return None;
+    }
+    unsafe { libc::close(fd) };
+    Some(file)
 }
 
 pub(crate) fn clear_media(path: &Path) -> io::Result<()> {

@@ -143,8 +143,8 @@ which removes the whole race class. The rest is fixed point by point below.
      3. It runs the normal shutdown tail: pairing aborted, phone stopped with the session
         saved for the revoke, socket removed, media and avatars cleared.
      4. `run()` then re-execs its own binary with `serve` (`CommandExt::exec` on
-        `current_exe()`). The flock fd is close-on-exec, so the new process takes the
-        lock.
+        `current_exe()`). It passes the flock fd through exec, so ownership has no gap;
+        the new process adopts the fd and clears the handoff variable.
    - **At startup**, after the lock and before the socket and the key lookup:
      - **`pending-unpair`:** run `phone::unpair(<data>/session.json)` and remove the
        marker. The result becomes the first state's `detail`:
@@ -170,7 +170,8 @@ which removes the whole race class. The rest is fixed point by point below.
      - **Uninstall failures:**
        - On any failure the marker stays. Startup goes on into state `fatal` with detail
          `uninstall_failed`, and the reason goes to the journal.
-       - In `fatal` only `state` and `uninstall` (retry) work.
+       - In `fatal` from `uninstall_failed`, only `state` and `uninstall` (retry) work.
+         A phone-raised `fatal` keeps its normal methods.
        - Each step is idempotent, so a retry, or the next login, finishes the job.
    - **What goes from the spec:**
      - Spec §1 says to stop the phone "without saving the session"; here it is saved
@@ -178,8 +179,9 @@ which removes the whole race class. The rest is fixed point by point below.
        same.
      - Spec §1 says the data dir is deleted; here the data dir keeps the empty `lock`
        file, because deleting it would let a second daemon take ownership mid-delete.
-   - **Signals:** a SIGTERM during the startup unpair waits for its 20 s at most. That is
-     inside systemd's stop timeout.
+   - **Signals:** a SIGTERM or SIGINT during startup marker work waits for the bounded
+     unpair, then exits 0 with the marker kept for next startup. A signal during the
+     shutdown tail also prevents re-exec and leaves the marker.
 4. **Logs.** Phone and store errors in the new paths go to the journal with `eprintln!`
    and no message text, numbers, names or ids. `phone.rs:1326-1328` (`lookup`) also stops
    logging conversation ids, because archive and restore now call it.
@@ -324,6 +326,18 @@ which removes the whole race class. The rest is fixed point by point below.
       - `systemctl --user start gmessages-tui` gives `login` with a fresh store.
 
 ## Deviations
+
+- **Step 2, review fixes** (Codex, Opus and agy diff reviews):
+  - The lock fd is inherited across exec, so ownership has no gap.
+  - A signal during startup or the shutdown tail leaves the marker for the next start.
+  - Only `uninstall_failed` gates a `fatal` daemon's requests.
+  - A failed unpair that leaves the session stays in login, for a retry.
+  - `key::forget` runs off the event loop, within 10 s.
+  - The runtime shuts down within 1 s, so a stuck keyring call can't hold the exit.
+  - The startup detail is applied once.
+  - Deleted messages aren't restored by late history.
+  - `chat.start` fetches history.
+  - The read and fetch logs carry no ids.
 
 - **Step 1, `busy()`:**
   - A send that timed out or disconnected stops counting as busy.

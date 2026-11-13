@@ -10,6 +10,10 @@ use std::path::Path;
 const KEYRING_SERVICE: &str = "gmessages-tui";
 const PASSPHRASE_VAR: &str = "GMESSAGES_TUI_PASSPHRASE";
 
+pub(crate) fn passphrase() -> Option<String> {
+    std::env::var(PASSPHRASE_VAR).ok()
+}
+
 #[derive(Debug)]
 pub enum KeyError {
     Empty,
@@ -41,7 +45,7 @@ fn keyring_error(error: keyring::Error) -> KeyError {
 /// The key of the store at `path`: `$GMESSAGES_TUI_PASSPHRASE`, else its keyring entry
 /// (a new random key if there is none and no store yet).
 pub fn store_key(path: &Path) -> Result<String, KeyError> {
-    if let Ok(passphrase) = std::env::var(PASSPHRASE_VAR) {
+    if let Some(passphrase) = passphrase() {
         return if passphrase.is_empty() {
             Err(KeyError::Empty)
         } else {

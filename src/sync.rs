@@ -42,6 +42,7 @@ pub struct Sync {
     actions: HashMap<u64, Action>,
     forgotten_actions: HashSet<u64>,
     contacts_cache: Vec<proto::ContactDto>,
+    deleted_messages: HashSet<String>,
 }
 
 enum Action {
@@ -119,6 +120,7 @@ impl Sync {
             actions: HashMap::new(),
             forgotten_actions: HashSet::new(),
             contacts_cache: Vec::new(),
+            deleted_messages: HashSet::new(),
         }
     }
 
@@ -798,6 +800,7 @@ impl Sync {
         let actions: Vec<_> = self.actions.drain().map(|(rid, _)| rid).collect();
         let forgotten = std::mem::take(&mut self.forgotten_actions);
         self.contacts_cache.clear();
+        self.deleted_messages.clear();
         ids.into_iter()
             .chain(reacts)
             .chain(actions.into_iter().filter(|rid| !forgotten.contains(rid)))
@@ -894,9 +897,13 @@ impl Sync {
                 error,
             } => {
                 let mut out = Vec::new();
-                if let Some(error) = error {
-                    tracing::warn!(%error, "cannot fetch history");
+                if error.is_some() {
+                    tracing::warn!("cannot fetch history");
                 } else {
+                    let messages: Vec<_> = messages
+                        .into_iter()
+                        .filter(|message| !self.deleted_messages.contains(&message.id))
+                        .collect();
                     for message in &messages {
                         self.remember_missed(message);
                     }
@@ -923,7 +930,13 @@ impl Sync {
                 conversation,
                 message,
                 old,
-            } => self.live(conversation, message, old),
+            } => {
+                if self.deleted_messages.contains(&message.id) {
+                    Vec::new()
+                } else {
+                    self.live(conversation, message, old)
+                }
+            }
             phone::Event::Conversation { conversation } => {
                 let before = self.unread();
                 if let Err(error) = self
@@ -1083,6 +1096,7 @@ impl Sync {
                         conversation,
                         message,
                     } => {
+                        self.deleted_messages.insert(message.clone());
                         if self.store.forget_message(&message).is_err() {
                             eprintln!("cannot forget message");
                         }
@@ -1159,6 +1173,14 @@ impl Sync {
                 let conversation = conversation.expect("checked above");
                 let name = conversation.id.clone();
                 let mut out = self.handle(phone::Event::Conversation { conversation });
+                if self
+                    .store
+                    .messages(&name)
+                    .map_or(true, |messages| messages.is_empty())
+                    || self.store.changed().is_ok_and(|ids| ids.contains(&name))
+                {
+                    self.fetch(vec![name.clone()]);
+                }
                 if !forgotten {
                     out.push(Self::ok(id, &proto::StartChatData { conversation: name }));
                 }
@@ -1949,6 +1971,44 @@ mod tests {
     }
 
     #[test]
+    fn deleted_message_cannot_return_from_late_history_or_live_event() {
+        let (mut sync, mut commands) = sync();
+        sync.delete_message(
+            1,
+            proto::DeleteMessageParams {
+                conversation: "c".into(),
+                message: "stored".into(),
+            },
+        );
+        commands.try_recv().unwrap();
+        sync.handle(phone::Event::Done { id: 1, error: None });
+        let late = message("stored", 100, false, false);
+        let out = sync.handle(phone::Event::History {
+            conversation: "c".into(),
+            messages: vec![late.clone()],
+            error: None,
+        });
+        assert_eq!(data(&out, "history")[0]["messages"], json!([]));
+        assert!(sync.store.message("stored").unwrap().is_none());
+        assert!(
+            sync.handle(phone::Event::Message {
+                conversation: "c".into(),
+                message: late.clone(),
+                old: false,
+            })
+            .is_empty()
+        );
+        assert!(sync.store.message("stored").unwrap().is_none());
+        sync.handle(phone::Event::Paired);
+        sync.handle(phone::Event::History {
+            conversation: "c".into(),
+            messages: vec![late],
+            error: None,
+        });
+        assert!(sync.store.message("stored").unwrap().is_some());
+    }
+
+    #[test]
     fn contacts_page_and_started_chat() {
         let (mut sync, mut commands) = sync();
         assert!(
@@ -2041,6 +2101,31 @@ mod tests {
             error: None,
         });
         error(&out, proto::ErrorCode::PhoneOffline);
+    }
+
+    #[test]
+    fn started_new_conversation_fetches_history() {
+        let (mut sync, mut commands) = sync();
+        sync.start_chat(
+            1,
+            proto::StartChatParams {
+                numbers: vec!["123".into()],
+            },
+        );
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            phone::Command::StartChat { id: 1, .. }
+        ));
+        let mut chat = conversation(false);
+        chat.id = "new".into();
+        sync.handle(phone::Event::Started {
+            id: 1,
+            conversation: Some(chat),
+            error: None,
+        });
+        assert!(
+            matches!(commands.try_recv().unwrap(), phone::Command::Fetch(ids) if ids == ["new"])
+        );
     }
 
     fn data(out: &[proto::Out], event: &str) -> Vec<Value> {
