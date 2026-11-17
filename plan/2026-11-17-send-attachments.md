@@ -321,3 +321,8 @@ Revert the step commits on `feat/send-attachments`; nothing else depends on them
 protocol changes are additive (`features`, `attachments`, a new error code), so a
 reverted daemon still works with a new plugin, which then hides the attach button, and
 the reverse.
+
+## Deviation after deploy
+
+Step 1's "set `media.dimensions`" is removed (`src/phone.rs` `send()`): the phone dropped
+picture parts that carried dimensions. See the spec's amendment.

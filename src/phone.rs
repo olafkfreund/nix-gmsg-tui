@@ -1454,7 +1454,8 @@ async fn send(
     let mut sent_media = Vec::new();
     for a in &attachments {
         let name = a.name.clone().unwrap_or_default();
-        let mut media = match client.upload_media(&a.data, &name, &a.content_type).await {
+        // No dimensions: the phone dropped pictures sent with them; mautrix sends none either.
+        let media = match client.upload_media(&a.data, &name, &a.content_type).await {
             Ok(media) => media,
             Err(error) => {
                 log::warn("attachment upload failed");
@@ -1462,12 +1463,6 @@ async fn send(
                 return SendOutcome::Attachment(format!("{name}: upload failed"));
             }
         };
-        if let (Some(width), Some(height)) = (a.width, a.height) {
-            media.dimensions = Some(gm::Dimensions {
-                width: width as i64,
-                height: height as i64,
-            });
-        }
         sent_media.push(serde_json::to_value(stored_medium(&media, None)).unwrap_or_default());
         outgoing = outgoing.with_media(media);
     }
