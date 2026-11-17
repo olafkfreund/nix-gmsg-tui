@@ -433,3 +433,21 @@ By hand on p620 after the deploy and a shell restart:
 Revert the step commits, or the merge commit, and bump the `gmessages` input in
 nixos_config back. The protocol changes are additive, so mixed versions keep working,
 with pictures hidden.
+
+## Deviations after the final review
+
+Findings from Codex's review and the Opus workflow (each confirmed by a refuting agent),
+fixed together:
+- `resetPreviews` cancels busy preview requests before dropping them. Otherwise the old
+  thread's jobs hold the daemon's 2 download slots while the new thread's previews time
+  out.
+- `mergeMessages` captures follow/anchor/offset once per event-loop turn
+  (`scrollPending`, applied by one `Qt.callLater(root.applyScroll)`). Two merges in one
+  turn used to anchor on the reset view and jump to the top.
+- `accept_preview` removes an existing file of the same name before writing, so a
+  better preview replaces an earlier inline fallback (`write_media` keeps existing
+  files).
+- `forget` drops keys whose waiter list became empty.
+- Tests: the 2 MiB case starts with real PNG magic, so the size check (not the format
+  check) refuses it; the GIF case checks the `.gif` extension; "a third key while 2 run"
+  checks that no command was sent.

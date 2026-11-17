@@ -665,6 +665,13 @@ impl Sync {
         hash.update(key.1.to_be_bytes());
         hash.update(b"preview");
         let path = dir.join(format!("{:x}.{ext}", hash.finalize()));
+        // write_media keeps an existing file; a newer preview must replace it.
+        if let Err(error) = fs::remove_file(&path)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            tracing::debug!(%error, "cannot replace preview");
+            return None;
+        }
         if let Err(error) = write_media(&path, bytes) {
             tracing::debug!(%error, "cannot write preview");
             return None;
@@ -918,6 +925,7 @@ impl Sync {
         for waiters in self.preview_waiters.values_mut() {
             waiters.retain(|&waiting| waiting != rid);
         }
+        self.preview_waiters.retain(|_, waiters| !waiters.is_empty());
         self.reacts.remove(&rid);
         // Timed out or disconnected: no one waits for it, so it no longer holds off unpair.
         self.sends.remove(&rid);
@@ -1923,13 +1931,16 @@ mod tests {
         assert_eq!(image_kind(b"GIF89a\x03\0\x02\0\0\0\0"), Some("gif"));
         let gif_size = imagesize::blob_size(b"GIF89a\x03\0\x02\0\0\0\0").unwrap();
         assert_eq!((gif_size.width, gif_size.height), (3, 2));
-        assert!(
+        assert_eq!(
             sync.accept_preview(
                 &("gif".into(), 0),
                 b"GIF89a\x03\0\x02\0\0\0\0",
                 PREVIEW_BUDGET
             )
-            .is_some()
+            .unwrap()
+            .extension()
+            .unwrap(),
+            "gif"
         );
         assert!(
             sync.accept_preview(&("junk".into(), 0), b"hello", PREVIEW_BUDGET)
@@ -1938,7 +1949,7 @@ mod tests {
         assert!(
             sync.accept_preview(
                 &("huge".into(), 0),
-                &vec![b'x'; phone::PREVIEW_MAX + 1],
+                &[TINY_PNG, &vec![0; phone::PREVIEW_MAX + 1 - TINY_PNG.len()]].concat(),
                 PREVIEW_BUDGET
             )
             .is_none()
@@ -2052,6 +2063,7 @@ mod tests {
         assert!(sync.preview(5, "preview-1", 0).is_empty());
         let _ = commands.try_recv().unwrap();
         assert!(sync.preview(6, "preview-2", 0).is_empty());
+        assert!(commands.try_recv().is_err());
         assert_eq!(sync.preview_jobs.len(), 1);
         for n in 3..34 {
             assert!(

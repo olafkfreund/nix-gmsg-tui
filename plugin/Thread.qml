@@ -111,36 +111,50 @@ Item {
             if (dt !== 0) return dt;
             return String(a.id).localeCompare(String(b.id));
         });
-        // Keep the reader's place: follow the end only when already there, else hold an anchor message.
-        var follow = msgList.atYEnd || root.messages.length === 0;
-        var ai = follow ? -1 : root.firstVisible(msgList.contentY + 1);
-        var anchor = ai >= 0 ? root.messages[ai] : null;
-        var anchorItem = ai >= 0 ? msgList.itemAtIndex(ai) : null;
-        var offset = anchorItem ? msgList.contentY - anchorItem.y : 0;
+        // Keep the reader's place: follow the end only when already there, else hold an anchor
+        // message. Captured once per event-loop turn: a second merge before the reposition would
+        // see the reset view (contentY 0) and anchor on the first message.
+        if (root.scrollPending === null) {
+            var follow = msgList.atYEnd || root.messages.length === 0;
+            var ai = follow ? -1 : root.firstVisible(msgList.contentY + 1);
+            var anchorItem = ai >= 0 ? msgList.itemAtIndex(ai) : null;
+            root.scrollPending = {
+                follow: follow,
+                anchor: ai >= 0 ? root.messages[ai] : null,
+                offset: anchorItem ? msgList.contentY - anchorItem.y : 0
+            };
+        }
         root.messages = merged;
-        Qt.callLater(function() {
-            if (msgList.count === 0) return;
-            if (follow || !anchor) {
-                msgList.positionViewAtEnd();
-                return;
-            }
-            var ni = -1;
-            for (var a = 0; a < merged.length; a++) {
-                if (merged[a].id === anchor.id) { ni = a; break; }
-            }
-            if (ni < 0) {
-                for (var b = 0; b < merged.length; b++) {
-                    if ((Number(merged[b].timestamp_ms) || 0) >= (Number(anchor.timestamp_ms) || 0)) { ni = b; break; }
-                }
-            }
-            if (ni < 0) {
-                msgList.positionViewAtEnd();
-                return;
-            }
-            msgList.positionViewAtIndex(ni, ListView.Beginning);
-            msgList.contentY += offset;
-        });
+        Qt.callLater(root.applyScroll);
         previewTimer.restart();
+    }
+
+    property var scrollPending: null
+
+    function applyScroll() {
+        var p = root.scrollPending;
+        root.scrollPending = null;
+        if (!p || msgList.count === 0) return;
+        var list = root.messages;
+        if (p.follow || !p.anchor) {
+            msgList.positionViewAtEnd();
+            return;
+        }
+        var ni = -1;
+        for (var a = 0; a < list.length; a++) {
+            if (list[a].id === p.anchor.id) { ni = a; break; }
+        }
+        if (ni < 0) {
+            for (var b = 0; b < list.length; b++) {
+                if ((Number(list[b].timestamp_ms) || 0) >= (Number(p.anchor.timestamp_ms) || 0)) { ni = b; break; }
+            }
+        }
+        if (ni < 0) {
+            msgList.positionViewAtEnd();
+            return;
+        }
+        msgList.positionViewAtIndex(ni, ListView.Beginning);
+        msgList.contentY += p.offset;
     }
 
     // State that outlives delegates (mergeMessages replaces the array on every event):
@@ -168,8 +182,11 @@ Item {
     function resetPreviews() {
         root.previewGen++;
         var next = ({});
+        var cancel = root.client.connected && root.canPreview;
         for (var k in root.ui) {
             if (k.indexOf("p:") !== 0) next[k] = root.ui[k];
+            // Queued jobs for the old view would hold the daemon's download slots.
+            else if (cancel && root.ui[k].busy) root.client.send("media.preview.cancel", root.previewParams(k), null);
         }
         root.ui = next;
     }
