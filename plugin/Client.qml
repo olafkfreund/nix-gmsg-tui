@@ -13,6 +13,8 @@ Item {
     property var detail: null
     property int unread: 0
     property bool mismatch: false
+    // What the connected daemon offers (from hello); empty while disconnected.
+    property var features: []
     // False after an uninstall: the daemon stays down until the next login.
     property bool autoRetry: true
 
@@ -70,7 +72,8 @@ Item {
         root.seq += 1;
         var id = root.seq;
         var slow = ["contacts", "chat.start", "archive", "restore", "delete.chat", "delete.message", "unpair", "uninstall"];
-        var ms = method === "send" ? 125000 : (method.indexOf("media.") === 0 ? 65000 : (slow.indexOf(method) >= 0 ? 35000 : 20000));
+        var files = method === "send" && params && params.attachments && params.attachments.length > 0;
+        var ms = files ? 905000 : method === "send" ? 125000 : (method.indexOf("media.") === 0 ? 65000 : (slow.indexOf(method) >= 0 ? 35000 : 20000));
         var t = timeoutTimer.createObject(root, { reqId: id, interval: ms, running: true });
         root.pending[id] = { cb: cb || null, timer: t };
         sock.write(JSON.stringify({ id: id, method: method, params: params || ({}) }) + "\n");
@@ -109,6 +112,7 @@ Item {
                 return;
             }
             root.mismatch = false;
+            root.features = Array.isArray(d.features) ? d.features : [];
             if (d.state !== undefined) root.state = String(d.state);
             root.detail = d.detail !== undefined ? d.detail : null;
             if (d.unread !== undefined) root.unread = Number(d.unread) || 0;
@@ -178,6 +182,7 @@ Item {
                 root.mismatch = false;
                 root.sendHello();
             } else {
+                root.features = [];
                 root.clearPending("disconnected");
                 retry.interval = root.delay;
                 root.delay = Math.min(10000, root.delay * 2);

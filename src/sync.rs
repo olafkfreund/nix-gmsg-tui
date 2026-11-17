@@ -39,6 +39,7 @@ pub struct Sync {
     downloads_in_flight: HashMap<u64, (String, u32)>,
     reacts: HashSet<u64>,
     sends: HashSet<u64>,
+    uploading: Option<u64>,
     actions: HashMap<u64, Action>,
     forgotten_actions: HashSet<u64>,
     contacts_cache: Vec<proto::ContactDto>,
@@ -117,6 +118,7 @@ impl Sync {
             downloads_in_flight: HashMap::new(),
             reacts: HashSet::new(),
             sends: HashSet::new(),
+            uploading: None,
             actions: HashMap::new(),
             forgotten_actions: HashSet::new(),
             contacts_cache: Vec::new(),
@@ -406,6 +408,15 @@ impl Sync {
         let (status, message) = match outcome {
             SendOutcome::Sent(message) => (proto::SendStatus::Sent, message),
             SendOutcome::Accepted(message) => (proto::SendStatus::Accepted, message),
+            SendOutcome::Attachment(message) => {
+                return vec![proto::Out::Reply {
+                    rid: id,
+                    result: Err(proto::ErrorBody {
+                        code: proto::ErrorCode::Attachment,
+                        message,
+                    }),
+                }];
+            }
             SendOutcome::Unavailable(message) => {
                 return vec![proto::Out::Reply {
                     rid: id,
@@ -677,6 +688,7 @@ impl Sync {
         self.reacts.remove(&rid);
         // Timed out or disconnected: no one waits for it, so it no longer holds off unpair.
         self.sends.remove(&rid);
+        // Keep uploading: the task still holds the files in memory until its Sent event.
         if self.actions.contains_key(&rid) {
             self.forgotten_actions.insert(rid);
         }
@@ -1021,6 +1033,9 @@ impl Sync {
                 outcome,
             } => {
                 self.sends.remove(&id);
+                if self.uploading == Some(id) {
+                    self.uploading = None;
+                }
                 self.sent(id, conversation, outcome)
             }
             phone::Event::Expired { message } => {
@@ -1189,15 +1204,29 @@ impl Sync {
         }
     }
 
-    pub fn send(&mut self, rid: u64, conversation: String, text: String, reply_to: Option<String>) {
+    pub fn send(
+        &mut self,
+        rid: u64,
+        conversation: String,
+        text: String,
+        reply_to: Option<String>,
+        files: Vec<PathBuf>,
+    ) -> bool {
+        if !files.is_empty() && self.uploading.is_some() {
+            return false;
+        }
+        if !files.is_empty() {
+            self.uploading = Some(rid);
+        }
         self.sends.insert(rid);
         self.commands.send(phone::Command::Send {
             id: rid,
             conversation,
             text,
             reply: reply_to,
-            attachments: Vec::new(),
+            files,
         });
+        true
     }
 
     pub fn read(&mut self, conversation: &str) -> Vec<proto::Out> {
@@ -1917,7 +1946,7 @@ mod tests {
                 .iter()
                 .any(|c| c.id == "c" && c.hidden)
         );
-        sync.send(2, "c".into(), "hi".into(), None);
+        assert!(sync.send(2, "c".into(), "hi".into(), None, Vec::new()));
         assert!(sync.busy());
         commands.try_recv().unwrap();
         sync.handle(phone::Event::Sent {
@@ -2310,6 +2339,63 @@ mod tests {
             assert_eq!(reply_data["message"]["pending"], status == "accepted");
             assert_eq!(data(&out, "message").len(), 1);
         }
+        assert!(matches!(commands.try_recv().unwrap(), phone::Command::Fetch(ids) if ids == ["c"]));
+    }
+
+    #[test]
+    fn upload_guard_outlives_forget_and_clears_only_on_matching_sent() {
+        let (mut sync, mut commands) = sync();
+        let file = PathBuf::from("/tmp/photo.png");
+        assert!(sync.send(1, "c".into(), "".into(), None, vec![file.clone()]));
+        assert!(
+            matches!(commands.try_recv().unwrap(), phone::Command::Send { id: 1, files, .. } if files == [file.clone()])
+        );
+        assert!(!sync.send(2, "c".into(), "".into(), None, vec![file.clone()]));
+        assert!(commands.try_recv().is_err());
+        assert!(sync.send(3, "c".into(), "text".into(), None, Vec::new()));
+        assert!(
+            matches!(commands.try_recv().unwrap(), phone::Command::Send { id: 3, files, .. } if files.is_empty())
+        );
+        sync.forget(1);
+        assert!(!sync.send(4, "c".into(), "".into(), None, vec![file.clone()]));
+        assert!(commands.try_recv().is_err());
+        sync.handle(phone::Event::Sent {
+            id: 3,
+            conversation: "c".into(),
+            outcome: phone::SendOutcome::Unavailable("offline".into()),
+        });
+        assert!(!sync.send(5, "c".into(), "".into(), None, vec![file.clone()]));
+        assert!(commands.try_recv().is_err());
+        let out = sync.handle(phone::Event::Sent {
+            id: 1,
+            conversation: "c".into(),
+            outcome: phone::SendOutcome::Attachment("photo.png: empty".into()),
+        });
+        assert!(
+            matches!(&out[0], proto::Out::Reply { rid: 1, result: Err(error) }
+            if error.code == proto::ErrorCode::Attachment && error.message == "photo.png: empty")
+        );
+        assert!(sync.send(6, "c".into(), "".into(), None, vec![file]));
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            phone::Command::Send { id: 6, .. }
+        ));
+    }
+
+    #[test]
+    fn accepted_send_event_keeps_uploaded_attachment_name() {
+        let (mut sync, mut commands) = sync();
+        let mut m = message("temporary", 500, true, false);
+        m.media = vec![medium("photo.png", "image/png")];
+        let out = sync.handle(phone::Event::Sent {
+            id: 1,
+            conversation: "c".into(),
+            outcome: phone::SendOutcome::Accepted(m),
+        });
+        assert_eq!(
+            data(&out, "message")[0]["message"]["attachments"][0]["name"],
+            "photo.png"
+        );
         assert!(matches!(commands.try_recv().unwrap(), phone::Command::Fetch(ids) if ids == ["c"]));
     }
 
