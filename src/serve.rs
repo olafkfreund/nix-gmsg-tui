@@ -574,6 +574,7 @@ impl Daemon {
                 state: self.state,
                 detail: self.detail.clone(),
                 unread: self.state_data().unread,
+                features: proto::FEATURES.iter().map(|s| s.to_string()).collect(),
             },
         );
         let _ = tx.try_send(serde_json::to_string(&hello).expect("hello serializes"));
@@ -1177,23 +1178,50 @@ impl Daemon {
             },
             "send" => {
                 reply = match params::<proto::SendParams>(request.params) {
-                    Ok(p) if p.conversation.is_empty() || p.text.is_empty() => {
-                        Err("conversation and text required".into())
+                    Ok(p)
+                        if p.conversation.is_empty()
+                            || (p.text.is_empty() && p.attachments.is_empty()) =>
+                    {
+                        Err("conversation and text or attachments required".into())
+                    }
+                    Ok(p) if p.attachments.len() > 10 => Err("at most 10 attachments".into()),
+                    Ok(p)
+                        if p.attachments
+                            .iter()
+                            .any(|a| a.is_empty() || !Path::new(a).is_absolute()) =>
+                    {
+                        Err("attachments must be absolute paths".into())
                     }
                     Ok(p) if self.state == proto::State::Ready => {
                         let rid = self.next_rid;
-                        self.next_rid += 1;
+                        let until =
+                            Duration::from_secs(if p.attachments.is_empty() { 120 } else { 900 });
+                        if !self.sync.as_mut().expect("store checked").send(
+                            rid,
+                            p.conversation,
+                            p.text,
+                            p.reply_to,
+                            p.attachments.into_iter().map(PathBuf::from).collect(),
+                        ) {
+                            self.write(
+                                conn,
+                                &proto::Reply::err(
+                                    Some(id),
+                                    proto::ErrorCode::Busy,
+                                    "another upload is in progress",
+                                ),
+                            );
+                            return;
+                        }
                         self.pending.insert(
                             rid,
                             Pending {
                                 conn,
                                 id,
-                                until: Instant::now() + Duration::from_secs(120),
+                                until: Instant::now() + until,
                             },
                         );
-                        if let Some(sync) = &mut self.sync {
-                            sync.send(rid, p.conversation, p.text, p.reply_to);
-                        }
+                        self.next_rid += 1;
                         return;
                     }
                     Ok(_) => {

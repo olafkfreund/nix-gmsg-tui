@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use crate::{phone, store};
 
 pub const PROTOCOL: u32 = 1;
+pub const FEATURES: &[&str] = &["attachments"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -345,6 +346,8 @@ pub struct SendParams {
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<String>,
+    #[serde(default)]
+    pub attachments: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -406,6 +409,8 @@ pub struct HelloEvent {
     pub state: State,
     pub detail: Option<String>,
     pub unread: i64,
+    #[serde(default)]
+    pub features: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -152,7 +152,9 @@ impl Client {
     }
 
     fn hello(&mut self) {
-        assert_eq!(self.recv()["data"]["protocol"], 1);
+        let hello = self.recv();
+        assert_eq!(hello["data"]["protocol"], 1);
+        assert_eq!(hello["data"]["features"], json!(["attachments"]));
         assert_eq!(
             self.request(0, "hello", json!({"protocol": 1, "role": "app"}))["ok"],
             true
@@ -183,6 +185,34 @@ fn protocol_and_login_methods() {
     assert_eq!(client.request(2, "state", json!({}))["ok"], true);
     assert_eq!(
         client.request(3, "send", json!({"conversation":"c", "text":"hello"}))["error"]["code"],
+        "not_paired"
+    );
+    assert_eq!(
+        client.request(10, "send", json!({"conversation":"c", "text":""}))["error"]["code"],
+        "bad_request"
+    );
+    assert_eq!(
+        client.request(
+            11,
+            "send",
+            json!({"conversation":"c", "text":"", "attachments": vec!["/tmp/a.png"; 11]})
+        )["error"]["code"],
+        "bad_request"
+    );
+    assert_eq!(
+        client.request(
+            12,
+            "send",
+            json!({"conversation":"c", "text":"", "attachments":["rel/a.png"]})
+        )["error"]["code"],
+        "bad_request"
+    );
+    assert_eq!(
+        client.request(
+            13,
+            "send",
+            json!({"conversation":"c", "text":"", "attachments":["/tmp/a.png"]})
+        )["error"]["code"],
         "not_paired"
     );
     assert_eq!(
