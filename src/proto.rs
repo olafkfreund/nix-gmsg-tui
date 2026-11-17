@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use crate::{phone, store};
 
 pub const PROTOCOL: u32 = 1;
-pub const FEATURES: &[&str] = &["attachments"];
+pub const FEATURES: &[&str] = &["attachments", "previews"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -134,6 +134,16 @@ pub struct Attachment {
     pub name: String,
     pub mime: String,
     pub size: i64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub width: i64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub height: i64,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub preview: bool,
+}
+
+fn is_zero(n: &i64) -> bool {
+    *n == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -233,10 +243,17 @@ impl Message {
             .media
             .iter()
             .filter_map(|v| serde_json::from_value::<phone::Medium>(v.clone()).ok())
-            .map(|d| Attachment {
-                name: d.name,
-                mime: d.mime,
-                size: d.size,
+            .map(|d| {
+                let dimensions = (1..=16384).contains(&d.width) && (1..=16384).contains(&d.height);
+                Attachment {
+                    name: d.name,
+                    preview: d.mime.starts_with("image/")
+                        && (!d.thumb_id.is_empty() || !d.inline.is_empty()),
+                    mime: d.mime,
+                    size: d.size,
+                    width: if dimensions { d.width } else { 0 },
+                    height: if dimensions { d.height } else { 0 },
+                }
             })
             .collect();
         let mut reactions: Vec<Reaction> = Vec::new();

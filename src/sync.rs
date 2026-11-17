@@ -6,6 +6,7 @@ use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use qrcode::QrCode;
 use qrcode::render::svg;
@@ -13,6 +14,17 @@ use serde_json::to_value;
 use sha2::{Digest, Sha256};
 
 use crate::{phone, proto, store};
+
+const PREVIEW_BUDGET: u64 = 64 * 1024 * 1024;
+
+struct PreviewJob {
+    key: (String, u32),
+    token: u64,
+    thumb_id: String,
+    thumb_key: Vec<u8>,
+    inline: Vec<u8>,
+    queued_at: Instant,
+}
 
 pub struct Sync {
     store: Rc<store::Store>,
@@ -37,6 +49,10 @@ pub struct Sync {
     waiters: HashMap<u64, Waiter>,
     queues: HashMap<String, VecDeque<u32>>,
     downloads_in_flight: HashMap<u64, (String, u32)>,
+    previews: HashMap<(String, u32), PathBuf>,
+    preview_jobs: VecDeque<PreviewJob>,
+    preview_running: HashMap<u64, PreviewJob>,
+    preview_waiters: HashMap<(String, u32), Vec<u64>>,
     reacts: HashSet<u64>,
     sends: HashSet<u64>,
     uploading: Option<u64>,
@@ -116,6 +132,10 @@ impl Sync {
             waiters: HashMap::new(),
             queues: HashMap::new(),
             downloads_in_flight: HashMap::new(),
+            previews: HashMap::new(),
+            preview_jobs: VecDeque::new(),
+            preview_running: HashMap::new(),
+            preview_waiters: HashMap::new(),
             reacts: HashSet::new(),
             sends: HashSet::new(),
             uploading: None,
@@ -507,6 +527,223 @@ impl Sync {
         }
     }
 
+    fn preview_reply(rid: u64, path: &Path) -> proto::Out {
+        proto::Out::Reply {
+            rid,
+            result: Ok(to_value(proto::MediaData {
+                path: path.to_string_lossy().into_owned(),
+            })
+            .expect("media data serializes")),
+        }
+    }
+
+    pub fn preview(&mut self, rid: u64, message: &str, index: u32) -> Vec<proto::Out> {
+        let medium = self
+            .store
+            .message(message)
+            .ok()
+            .flatten()
+            .and_then(|stored| {
+                stored
+                    .media
+                    .into_iter()
+                    .filter_map(|v| serde_json::from_value::<phone::Medium>(v).ok())
+                    .nth(index as usize)
+            });
+        let Some(medium) = medium.filter(|m| {
+            m.mime.starts_with("image/") && (!m.thumb_id.is_empty() || !m.inline.is_empty())
+        }) else {
+            return vec![Self::reply(rid, proto::ErrorCode::NotFound, "no preview")];
+        };
+        let key = (message.to_owned(), index);
+        if let Some(path) = self.previews.get(&key) {
+            if path.exists() {
+                return vec![Self::preview_reply(rid, path)];
+            }
+            self.previews.remove(&key);
+        }
+        if medium.thumb_id.is_empty() {
+            return vec![
+                match self.accept_preview(&key, &medium.inline, PREVIEW_BUDGET) {
+                    Some(path) => Self::preview_reply(rid, &path),
+                    None => Self::reply(rid, proto::ErrorCode::NotFound, "no preview"),
+                },
+            ];
+        }
+        if !self.ready {
+            return vec![Self::reply(
+                rid,
+                proto::ErrorCode::PhoneOffline,
+                "phone offline",
+            )];
+        }
+        if self.preview_jobs.iter().any(|j| j.key == key)
+            || self.preview_running.values().any(|j| j.key == key)
+        {
+            self.preview_waiters.entry(key).or_default().push(rid);
+            return Vec::new();
+        }
+        if self.preview_jobs.len() >= 32 {
+            return vec![Self::reply(rid, proto::ErrorCode::Busy, "queue full")];
+        }
+        self.preview_waiters.insert(key.clone(), vec![rid]);
+        self.next_token += 1;
+        self.preview_jobs.push_back(PreviewJob {
+            key,
+            token: self.next_token,
+            thumb_id: medium.thumb_id,
+            thumb_key: medium.thumb_key,
+            inline: medium.inline,
+            queued_at: Instant::now(),
+        });
+        self.pump_previews(Instant::now())
+    }
+
+    pub fn pump_previews(&mut self, now: Instant) -> Vec<proto::Out> {
+        self.preview_jobs.retain(|j| {
+            self.preview_waiters
+                .get(&j.key)
+                .is_some_and(|w| !w.is_empty())
+        });
+        let mut out = Vec::new();
+        self.preview_jobs.retain(|j| {
+            if now.saturating_duration_since(j.queued_at) > Duration::from_secs(25) {
+                for rid in self.preview_waiters.remove(&j.key).unwrap_or_default() {
+                    out.push(Self::reply(rid, proto::ErrorCode::Busy, "expired"));
+                }
+                false
+            } else {
+                true
+            }
+        });
+        while self.preview_running.len() < 2 {
+            let Some(job) = self.preview_jobs.pop_front() else {
+                break;
+            };
+            if self.commands.send(phone::Command::Preview {
+                id: job.token,
+                thumb_id: job.thumb_id.clone(),
+                thumb_key: job.thumb_key.clone(),
+            }) {
+                self.preview_running.insert(job.token, job);
+            } else {
+                for rid in self.preview_waiters.remove(&job.key).unwrap_or_default() {
+                    out.push(Self::reply(
+                        rid,
+                        proto::ErrorCode::PhoneOffline,
+                        "phone offline",
+                    ));
+                }
+            }
+        }
+        out
+    }
+
+    fn accept_preview(
+        &mut self,
+        key: &(String, u32),
+        bytes: &[u8],
+        budget: u64,
+    ) -> Option<PathBuf> {
+        let ext = image_kind(bytes)?;
+        if bytes.len() > phone::PREVIEW_MAX {
+            return None;
+        }
+        let size = imagesize::blob_size(bytes).ok()?;
+        let (w, h) = (size.width as u64, size.height as u64);
+        if w == 0 || h == 0 || w > 16384 || h > 16384 || w * h > 40_000_000 {
+            return None;
+        }
+        let dir = self.media_dir.join("previews");
+        if let Err(error) = crate::paths::create_private_dir(&dir) {
+            tracing::debug!(%error, "cannot create preview directory");
+            return None;
+        }
+        let mut hash = Sha256::new();
+        hash.update(key.0.as_bytes());
+        hash.update([0]);
+        hash.update(key.1.to_be_bytes());
+        hash.update(b"preview");
+        let path = dir.join(format!("{:x}.{ext}", hash.finalize()));
+        // write_media keeps an existing file; a newer preview must replace it.
+        if let Err(error) = fs::remove_file(&path)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            tracing::debug!(%error, "cannot replace preview");
+            return None;
+        }
+        if let Err(error) = write_media(&path, bytes) {
+            tracing::debug!(%error, "cannot write preview");
+            return None;
+        }
+        self.previews.insert(key.clone(), path.clone());
+        self.evict_previews(&path, budget);
+        Some(path)
+    }
+
+    fn evict_previews(&mut self, keep: &Path, budget: u64) {
+        let Ok(entries) = fs::read_dir(self.media_dir.join("previews")) else {
+            return;
+        };
+        let mut files = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name.to_string_lossy().ends_with(".tmp") {
+                continue;
+            }
+            if let Ok(meta) = entry.metadata()
+                && meta.is_file()
+            {
+                files.push((
+                    meta.modified().unwrap_or(std::time::UNIX_EPOCH),
+                    name,
+                    entry.path(),
+                    meta.len(),
+                ));
+            }
+        }
+        files.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        let mut total: u64 = files.iter().map(|f| f.3).sum();
+        for (_, _, path, len) in files {
+            if total <= budget {
+                break;
+            }
+            if path == keep {
+                continue;
+            }
+            match fs::remove_file(&path) {
+                Ok(()) => {
+                    total -= len;
+                    self.previews.retain(|_, cached| cached != &path);
+                }
+                Err(error) => tracing::debug!(%error, "cannot evict preview"),
+            }
+        }
+        if total > budget {
+            tracing::warn!("preview cache over budget");
+        }
+    }
+
+    pub fn cancel_preview(&mut self, message: &str, index: u32, rids: &[u64]) -> Vec<proto::Out> {
+        let key = (message.to_owned(), index);
+        let mut out = Vec::new();
+        if let Some(waiters) = self.preview_waiters.get_mut(&key) {
+            waiters.retain(|rid| {
+                if rids.contains(rid) {
+                    out.push(Self::reply(*rid, proto::ErrorCode::Busy, "cancelled"));
+                    false
+                } else {
+                    true
+                }
+            });
+            if waiters.is_empty() {
+                self.preview_waiters.remove(&key);
+                self.preview_jobs.retain(|j| j.key != key);
+            }
+        }
+        out
+    }
+
     pub fn media(&mut self, rid: u64, message: &str, index: u32, save: bool) -> Vec<proto::Out> {
         let Ok(Some(stored)) = self.store.message(message) else {
             return vec![Self::reply(
@@ -685,6 +922,10 @@ impl Sync {
 
     pub fn forget(&mut self, rid: u64) {
         self.waiters.remove(&rid);
+        for waiters in self.preview_waiters.values_mut() {
+            waiters.retain(|&waiting| waiting != rid);
+        }
+        self.preview_waiters.retain(|_, waiters| !waiters.is_empty());
         self.reacts.remove(&rid);
         // Timed out or disconnected: no one waits for it, so it no longer holds off unpair.
         self.sends.remove(&rid);
@@ -808,16 +1049,31 @@ impl Sync {
         self.waiters.clear();
         self.queues.clear();
         self.downloads_in_flight.clear();
+        self.previews.clear();
+        self.preview_jobs.clear();
+        self.preview_running.clear();
+        let preview_rids: Vec<_> = self
+            .preview_waiters
+            .drain()
+            .flat_map(|(_, rids)| rids)
+            .collect();
         let reacts: Vec<_> = self.reacts.drain().collect();
         let actions: Vec<_> = self.actions.drain().map(|(rid, _)| rid).collect();
         let forgotten = std::mem::take(&mut self.forgotten_actions);
         self.contacts_cache.clear();
         self.deleted_messages.clear();
-        ids.into_iter()
+        let mut out: Vec<_> = ids
+            .into_iter()
             .chain(reacts)
             .chain(actions.into_iter().filter(|rid| !forgotten.contains(rid)))
             .map(|rid| Self::reply(rid, proto::ErrorCode::NotPaired, "phone not paired"))
-            .collect()
+            .collect();
+        out.extend(
+            preview_rids
+                .into_iter()
+                .map(|rid| Self::reply(rid, proto::ErrorCode::Busy, "reset")),
+        );
+        out
     }
 
     pub fn handle(&mut self, event: phone::Event) -> Vec<proto::Out> {
@@ -1066,6 +1322,37 @@ impl Sync {
                 attachments,
                 error,
             } => self.downloaded(id, attachments, error),
+            phone::Event::Previewed { id, result } => {
+                let Some(job) = self.preview_running.remove(&id) else {
+                    return Vec::new();
+                };
+                let path = result
+                    .as_ref()
+                    .ok()
+                    .and_then(|bytes| self.accept_preview(&job.key, bytes, PREVIEW_BUDGET))
+                    .or_else(|| {
+                        (!job.inline.is_empty())
+                            .then(|| self.accept_preview(&job.key, &job.inline, PREVIEW_BUDGET))
+                            .flatten()
+                    });
+                let mut out: Vec<_> = self
+                    .preview_waiters
+                    .remove(&job.key)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|rid| match &path {
+                        Some(path) => Self::preview_reply(rid, path),
+                        None if result.is_err() => Self::reply(
+                            rid,
+                            proto::ErrorCode::PhoneOffline,
+                            "preview download failed",
+                        ),
+                        None => Self::reply(rid, proto::ErrorCode::NotFound, "no preview"),
+                    })
+                    .collect();
+                out.extend(self.pump_previews(Instant::now()));
+                out
+            }
             phone::Event::Done { id, error } if self.reacts.remove(&id) => {
                 if let Some(error) = error {
                     tracing::debug!(%error, "phone reaction failed");
@@ -1321,13 +1608,7 @@ fn save_avatar(dir: &Path, image: &[u8]) -> io::Result<Option<String>> {
     if image.len() > 256 * 1024 {
         return Ok(None);
     }
-    let ext = if image.starts_with(&[0xff, 0xd8, 0xff]) {
-        "jpg"
-    } else if image.starts_with(&[0x89, b'P', b'N', b'G', 13, 10, 26, 10]) {
-        "png"
-    } else if image.starts_with(b"RIFF") && image.get(8..12) == Some(b"WEBP".as_slice()) {
-        "webp"
-    } else {
+    let Some(ext) = image_kind(image).filter(|&kind| kind != "gif") else {
         return Ok(None);
     };
     let Ok(size) = imagesize::blob_size(image) else {
@@ -1354,6 +1635,21 @@ fn save_avatar(dir: &Path, image: &[u8]) -> io::Result<Option<String>> {
         fs::rename(&temp, &path)?;
     }
     Ok(Some(path.to_string_lossy().into_owned()))
+}
+
+fn image_kind(image: &[u8]) -> Option<&'static str> {
+    let ext = if image.starts_with(&[0xff, 0xd8, 0xff]) {
+        "jpg"
+    } else if image.starts_with(&[0x89, b'P', b'N', b'G', 13, 10, 26, 10]) {
+        "png"
+    } else if image.starts_with(b"RIFF") && image.get(8..12) == Some(b"WEBP".as_slice()) {
+        "webp"
+    } else if image.starts_with(b"GIF87a") || image.starts_with(b"GIF89a") {
+        "gif"
+    } else {
+        return None;
+    };
+    Some(ext)
 }
 
 fn extension(mime: &str) -> &'static str {
@@ -1567,6 +1863,394 @@ mod tests {
         image[16..20].copy_from_slice(&width.to_be_bytes());
         image[20..24].copy_from_slice(&height.to_be_bytes());
         image
+    }
+
+    const TINY_PNG: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52, 0, 0,
+        0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 0x1f, 0x15, 0xc4, 0x89, 0, 0, 0, 10, 0x49, 0x44, 0x41,
+        0x54, 0x78, 0x9c, 0x63, 0, 1, 0, 0, 5, 0, 1, 0xa5, 0xf6, 0x45, 0x40, 0, 0, 0, 0, 0x49,
+        0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+
+    fn preview_medium(id: &str, inline: &[u8]) -> Value {
+        serde_json::to_value(phone::Medium {
+            mime: "image/png".into(),
+            thumb_id: id.into(),
+            inline: inline.to_vec(),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    fn with_preview_messages(sync: &Sync, count: usize) {
+        let messages: Vec<_> = (0..count)
+            .map(|n| {
+                let mut m = message(&format!("preview-{n}"), n as i64 + 1, false, false);
+                m.media = vec![preview_medium("thumb", &[])];
+                m
+            })
+            .collect();
+        sync.store.save_messages("c", &messages).unwrap();
+    }
+
+    #[test]
+    fn preview_image_checks_and_protocol_metadata() {
+        let (mut sync, _) = sync();
+        let key = ("image".into(), 0);
+        assert_eq!(image_kind(TINY_PNG), Some("png"));
+        assert!(
+            sync.accept_preview(&key, TINY_PNG, PREVIEW_BUDGET)
+                .unwrap()
+                .extension()
+                .unwrap()
+                == "png"
+        );
+        let jpeg = [
+            0xff, 0xd8, 0xff, 0xe0, 0, 4, 0, 0, 0xff, 0xc0, 0, 11, 8, 0, 6, 0, 8, 1, 1, 0x11, 0,
+        ];
+        assert_eq!(image_kind(&jpeg), Some("jpg"));
+        assert_eq!(
+            sync.accept_preview(&("jpeg".into(), 0), &jpeg, PREVIEW_BUDGET)
+                .unwrap()
+                .extension()
+                .unwrap(),
+            "jpg"
+        );
+        let webp = [
+            b'R', b'I', b'F', b'F', 17, 0, 0, 0, b'W', b'E', b'B', b'P', b'V', b'P', b'8', b'L', 5,
+            0, 0, 0, 0x2f, 1, 0x40, 0, 0,
+        ];
+        assert_eq!(image_kind(&webp), Some("webp"));
+        assert_eq!(
+            sync.accept_preview(&("webp".into(), 0), &webp, PREVIEW_BUDGET)
+                .unwrap()
+                .extension()
+                .unwrap(),
+            "webp"
+        );
+        assert_eq!(image_kind(b"GIF89a\x03\0\x02\0\0\0\0"), Some("gif"));
+        let gif_size = imagesize::blob_size(b"GIF89a\x03\0\x02\0\0\0\0").unwrap();
+        assert_eq!((gif_size.width, gif_size.height), (3, 2));
+        assert_eq!(
+            sync.accept_preview(
+                &("gif".into(), 0),
+                b"GIF89a\x03\0\x02\0\0\0\0",
+                PREVIEW_BUDGET
+            )
+            .unwrap()
+            .extension()
+            .unwrap(),
+            "gif"
+        );
+        assert!(
+            sync.accept_preview(&("junk".into(), 0), b"hello", PREVIEW_BUDGET)
+                .is_none()
+        );
+        assert!(
+            sync.accept_preview(
+                &("huge".into(), 0),
+                &[TINY_PNG, &vec![0; phone::PREVIEW_MAX + 1 - TINY_PNG.len()]].concat(),
+                PREVIEW_BUDGET
+            )
+            .is_none()
+        );
+        for (w, h) in [(10000, 5000), (20000, 1), (0, 10)] {
+            assert!(
+                sync.accept_preview(&(format!("{w}-{h}"), 0), &png(w, h), PREVIEW_BUDGET)
+                    .is_none()
+            );
+        }
+        assert!(
+            sync.accept_preview(&("truncated".into(), 0), &TINY_PNG[..15], PREVIEW_BUDGET)
+                .is_none()
+        );
+        let mut m = message("meta", 1, false, false);
+        m.media = vec![
+            serde_json::to_value(phone::Medium {
+                mime: "image/jpeg".into(),
+                thumb_id: "t".into(),
+                width: 640,
+                height: 480,
+                ..Default::default()
+            })
+            .unwrap(),
+            serde_json::to_value(phone::Medium {
+                mime: "application/pdf".into(),
+                thumb_id: "t".into(),
+                ..Default::default()
+            })
+            .unwrap(),
+            serde_json::to_value(phone::Medium {
+                mime: "image/png".into(),
+                ..Default::default()
+            })
+            .unwrap(),
+            serde_json::to_value(phone::Medium {
+                mime: "image/png".into(),
+                width: 0,
+                height: 480,
+                ..Default::default()
+            })
+            .unwrap(),
+            serde_json::to_value(phone::Medium {
+                mime: "image/png".into(),
+                width: 20000,
+                height: 10,
+                ..Default::default()
+            })
+            .unwrap(),
+        ];
+        let wire = proto::Message::from_phone("c", &m, false);
+        assert_eq!(
+            (
+                wire.attachments[0].width,
+                wire.attachments[0].height,
+                wire.attachments[0].preview
+            ),
+            (640, 480, true)
+        );
+        assert!(!wire.attachments[1].preview && !wire.attachments[2].preview);
+        assert_eq!(
+            (wire.attachments[3].width, wire.attachments[3].height),
+            (0, 0)
+        );
+        assert_eq!(
+            (wire.attachments[4].width, wire.attachments[4].height),
+            (0, 0)
+        );
+        let empty = serde_json::to_value(&wire.attachments[2]).unwrap();
+        assert!(
+            empty.get("width").is_none()
+                && empty.get("height").is_none()
+                && empty.get("preview").is_none()
+        );
+        let inline = proto::Message::from_phone(
+            "c",
+            &phone::Message {
+                media: vec![preview_medium("", TINY_PNG)],
+                ..m
+            },
+            false,
+        );
+        assert!(inline.attachments[0].preview);
+    }
+
+    #[test]
+    fn preview_queue_waiters_and_results() {
+        let (mut sync, mut commands) = sync();
+        with_preview_messages(&sync, 36);
+        sync.ready = true;
+        error(&sync.preview(1, "missing", 0), proto::ErrorCode::NotFound);
+        error(&sync.preview(2, "preview-0", 1), proto::ErrorCode::NotFound);
+        let mut pdf = message("pdf", 123, false, false);
+        pdf.media = vec![
+            serde_json::to_value(phone::Medium {
+                mime: "application/pdf".into(),
+                thumb_id: "thumb".into(),
+                ..Default::default()
+            })
+            .unwrap(),
+        ];
+        sync.store.save_messages("c", &[pdf]).unwrap();
+        error(&sync.preview(20, "pdf", 0), proto::ErrorCode::NotFound);
+        assert!(sync.preview(3, "preview-0", 0).is_empty());
+        let token = match commands.try_recv().unwrap() {
+            phone::Command::Preview { id, .. } => id,
+            _ => panic!("preview command"),
+        };
+        assert!(sync.preview(4, "preview-0", 0).is_empty());
+        assert!(commands.try_recv().is_err());
+        assert!(sync.preview(5, "preview-1", 0).is_empty());
+        let _ = commands.try_recv().unwrap();
+        assert!(sync.preview(6, "preview-2", 0).is_empty());
+        assert!(commands.try_recv().is_err());
+        assert_eq!(sync.preview_jobs.len(), 1);
+        for n in 3..34 {
+            assert!(
+                sync.preview(100 + n as u64, &format!("preview-{n}"), 0)
+                    .is_empty()
+            );
+        }
+        error(&sync.preview(200, "preview-34", 0), proto::ErrorCode::Busy);
+        assert!(!sync.preview_waiters.contains_key(&("preview-34".into(), 0)));
+        let out = sync.handle(phone::Event::Previewed {
+            id: token,
+            result: Ok(TINY_PNG.to_vec()),
+        });
+        assert_eq!(path(&out, 3), path(&out[1..], 4));
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            phone::Command::Preview { .. }
+        ));
+        assert!(
+            sync.handle(phone::Event::Previewed {
+                id: u64::MAX,
+                result: Ok(vec![])
+            })
+            .is_empty()
+        );
+        let saved = path(&sync.preview(7, "preview-0", 0), 7);
+        fs::remove_file(saved).unwrap();
+        assert!(sync.preview(8, "preview-0", 0).is_empty());
+    }
+
+    #[test]
+    fn preview_inline_fallback_cancel_expiry_and_reset() {
+        let (mut sync, mut commands) = sync();
+        with_preview_messages(&sync, 4);
+        let mut inline = message("inline", 8, false, false);
+        inline.media = vec![preview_medium("", TINY_PNG)];
+        sync.store.save_messages("c", &[inline]).unwrap();
+        let inline_path = path(&sync.preview(1, "inline", 0), 1);
+        assert!(inline_path.starts_with(sync.media_dir.join("previews")));
+        let mut wrong_mime = message("wrong-mime", 9, false, false);
+        let mut medium = preview_medium("", TINY_PNG);
+        medium["mime"] = json!("image/jpeg");
+        wrong_mime.media = vec![medium];
+        sync.store.save_messages("c", &[wrong_mime]).unwrap();
+        assert_eq!(
+            path(&sync.preview(11, "wrong-mime", 0), 11)
+                .extension()
+                .unwrap(),
+            "png"
+        );
+        sync.ready = true;
+        assert!(sync.preview(2, "preview-0", 0).is_empty());
+        let token = match commands.try_recv().unwrap() {
+            phone::Command::Preview { id, .. } => id,
+            _ => panic!(),
+        };
+        assert!(sync.preview(3, "preview-0", 0).is_empty());
+        error(
+            &sync.cancel_preview("preview-0", 0, &[2]),
+            proto::ErrorCode::Busy,
+        );
+        let out = sync.handle(phone::Event::Previewed {
+            id: token,
+            result: Ok(TINY_PNG.to_vec()),
+        });
+        assert_eq!(path(&out, 3).extension().unwrap(), "png");
+        assert!(sync.preview(4, "preview-1", 0).is_empty());
+        let token = match commands.try_recv().unwrap() {
+            phone::Command::Preview { id, .. } => id,
+            _ => panic!(),
+        };
+        error(
+            &sync.handle(phone::Event::Previewed {
+                id: token,
+                result: Ok(b"junk".to_vec()),
+            }),
+            proto::ErrorCode::NotFound,
+        );
+        assert!(sync.preview(5, "preview-2", 0).is_empty());
+        let token = match commands.try_recv().unwrap() {
+            phone::Command::Preview { id, .. } => id,
+            _ => panic!(),
+        };
+        error(
+            &sync.handle(phone::Event::Previewed {
+                id: token,
+                result: Err("failed".into()),
+            }),
+            proto::ErrorCode::PhoneOffline,
+        );
+
+        let mut fallback = message("fallback", 9, false, false);
+        fallback.media = vec![preview_medium("thumb", TINY_PNG)];
+        sync.store.save_messages("c", &[fallback]).unwrap();
+        assert!(sync.preview(6, "fallback", 0).is_empty());
+        let token = match commands.try_recv().unwrap() {
+            phone::Command::Preview { id, .. } => id,
+            _ => panic!(),
+        };
+        assert_eq!(
+            path(
+                &sync.handle(phone::Event::Previewed {
+                    id: token,
+                    result: Ok(b"junk".to_vec())
+                }),
+                6
+            )
+            .extension()
+            .unwrap(),
+            "png"
+        );
+
+        assert!(sync.preview(7, "preview-0", 0).len() == 1); // cached
+        assert!(sync.preview(8, "preview-1", 0).is_empty());
+        let _ = commands.try_recv().unwrap();
+        assert!(sync.preview(9, "preview-2", 0).is_empty());
+        let _ = commands.try_recv().unwrap();
+        assert!(sync.preview(10, "preview-3", 0).is_empty());
+        let out = sync.pump_previews(Instant::now() + Duration::from_secs(26));
+        error(&out, proto::ErrorCode::Busy);
+        assert!(!sync.preview_waiters.contains_key(&("preview-3".into(), 0)));
+        let out = sync.reset_media();
+        assert_eq!(out.iter().filter(|o| matches!(o, proto::Out::Reply { result: Err(e), .. } if e.code == proto::ErrorCode::Busy)).count(), 2);
+        assert!(
+            sync.previews.is_empty()
+                && sync.preview_jobs.is_empty()
+                && sync.preview_running.is_empty()
+                && sync.preview_waiters.is_empty()
+        );
+    }
+
+    #[test]
+    fn preview_forget_and_closed_channel() {
+        let (mut sync, mut commands) = sync();
+        with_preview_messages(&sync, 3);
+        sync.ready = true;
+        sync.preview(1, "preview-0", 0);
+        sync.preview(2, "preview-1", 0);
+        let _ = commands.try_recv().unwrap();
+        let _ = commands.try_recv().unwrap();
+        sync.preview(3, "preview-2", 0);
+        sync.forget(3);
+        assert!(sync.pump_previews(Instant::now()).is_empty());
+        assert!(sync.preview_jobs.is_empty());
+        drop(commands);
+        let (mut sync, commands) = self::sync();
+        with_preview_messages(&sync, 1);
+        sync.ready = true;
+        drop(commands);
+        error(
+            &sync.preview(4, "preview-0", 0),
+            proto::ErrorCode::PhoneOffline,
+        );
+        assert!(sync.preview_running.is_empty());
+    }
+
+    #[test]
+    fn preview_eviction_oldest_first_keeps_current_file() {
+        use std::fs::File;
+        use std::time::SystemTime;
+        let (mut sync, _) = sync();
+        let dir = sync.media_dir.join("previews");
+        crate::paths::create_private_dir(&dir).unwrap();
+        let paths: Vec<_> = ["old", "middle", "keep"]
+            .into_iter()
+            .map(|name| dir.join(name))
+            .collect();
+        for (n, path) in paths.iter().enumerate() {
+            fs::write(path, b"123456").unwrap();
+            File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(n as u64 + 1))
+                .unwrap();
+            sync.previews.insert((format!("p{n}"), 0), path.clone());
+        }
+        sync.evict_previews(&paths[2], 10);
+        assert!(!paths[0].exists() && !paths[1].exists() && paths[2].exists());
+        assert_eq!(sync.previews.len(), 1);
+
+        fs::write(&paths[0], b"123456").unwrap();
+        fs::write(&paths[1], b"123456").unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+        sync.evict_previews(&paths[2], 10);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(paths.iter().all(|p| p.exists()));
     }
 
     fn sync() -> (Sync, UnboundedReceiver<phone::Command>) {

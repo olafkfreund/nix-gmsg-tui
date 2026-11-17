@@ -54,6 +54,10 @@ pub enum Event {
         attachments: Vec<Attachment>,
         error: Option<String>,
     },
+    Previewed {
+        id: u64,
+        result: Result<Vec<u8>, String>,
+    },
     /// The pictures requested by `Avatars`, keyed by their prefixed ids.
     Avatars {
         id: u64,
@@ -152,6 +156,11 @@ pub enum Command {
         id: u64,
         message: String,
         media: Vec<serde_json::Value>,
+    },
+    Preview {
+        id: u64,
+        thumb_id: String,
+        thumb_key: Vec<u8>,
     },
     /// Fetches contact and participant pictures: `Avatars`.
     Avatars {
@@ -356,6 +365,7 @@ const ECHO_WAIT: Duration = Duration::from_secs(10);
 const SEND_WAIT: Duration = Duration::from_secs(870);
 /// How long the phone has to send a medium in full, once asked.
 const FULL_MEDIUM_WAIT: Duration = Duration::from_secs(30);
+pub const PREVIEW_MAX: usize = 2 * 1024 * 1024;
 /// Between two attempts to make the session active, until it is.
 const ACTIVATE_RETRY: Duration = Duration::from_secs(10);
 
@@ -1132,6 +1142,21 @@ async fn run_commands(state: Rc<State>, mut commands: UnboundedReceiver<Command>
                     state.emit(event);
                 });
             }
+            Command::Preview {
+                id,
+                thumb_id,
+                thumb_key,
+            } => {
+                tokio::task::spawn_local(async move {
+                    let result = tokio::time::timeout(
+                        Duration::from_secs(30),
+                        preview(&state, thumb_id, thumb_key),
+                    )
+                    .await
+                    .unwrap_or_else(|_| Err("preview download failed".into()));
+                    state.emit(Event::Previewed { id, result });
+                });
+            }
             Command::Avatars { id, ids } => {
                 tokio::task::spawn_local(async move {
                     state.emit(avatars(&state, id, ids).await);
@@ -1634,6 +1659,40 @@ fn check_size(declared: i64, actual: usize) -> Result<(), String> {
     Ok(())
 }
 
+/// Appends `chunk` to `buf`, refusing it before appending if `buf` would pass `cap`.
+fn push_capped(buf: &mut Vec<u8>, chunk: &[u8], cap: usize) -> Result<(), String> {
+    if chunk.len() > cap.saturating_sub(buf.len()) {
+        return Err("preview too large".into());
+    }
+    buf.extend_from_slice(chunk);
+    Ok(())
+}
+
+async fn preview(state: &State, thumb_id: String, thumb_key: Vec<u8>) -> Result<Vec<u8>, String> {
+    let client = state.client().map_err(|error| {
+        tracing::debug!(%error, "preview client unavailable");
+        "preview download failed".to_string()
+    })?;
+    let mut stream = client
+        .download_media_stream(&thumb_id, &thumb_key)
+        .await
+        .map_err(|error| {
+            tracing::debug!(%error, "preview download failed");
+            "preview download failed".to_string()
+        })?;
+    let mut buf = Vec::new();
+    loop {
+        match stream.next_chunk().await {
+            Ok(Some(chunk)) => push_capped(&mut buf, &chunk, PREVIEW_MAX)?,
+            Ok(None) => return Ok(buf),
+            Err(error) => {
+                tracing::debug!(%error, "preview stream failed");
+                return Err("preview download failed".into());
+            }
+        }
+    }
+}
+
 /// Downloads `media`, of `message`; those the phone has sent only as previews are asked in
 /// full first.
 async fn download(
@@ -2049,6 +2108,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn preview_cap_rejects_chunk_before_append() {
+        let mut bytes = Vec::new();
+        push_capped(&mut bytes, &[1, 2, 3], 5).unwrap();
+        assert_eq!(
+            push_capped(&mut bytes, &[4, 5, 6], 5),
+            Err("preview too large".into())
+        );
+        assert_eq!(bytes.len(), 3);
+    }
+
+    #[test]
     fn check_size_caps_declared_and_real() {
         assert!(check_size(10, 10).is_ok());
         assert!(check_size(0, MEDIA_MAX).is_ok());
@@ -2102,7 +2172,12 @@ mod tests {
         let second = dir.join("second.txt");
         fs::write(&first, b"123456").unwrap();
         fs::write(&second, b"123456").unwrap();
-        assert_eq!(read_files(std::slice::from_ref(&first), 10).unwrap()[0].data.len(), 6);
+        assert_eq!(
+            read_files(std::slice::from_ref(&first), 10).unwrap()[0]
+                .data
+                .len(),
+            6
+        );
         assert_eq!(
             read_files(&[first, second], 10).unwrap_err(),
             "second.txt: too large (over 100 MiB in all)"

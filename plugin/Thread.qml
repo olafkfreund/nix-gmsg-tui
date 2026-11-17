@@ -58,6 +58,7 @@ Item {
         root.typingPeer = "";
         root.readOwed = false;
         if (root.conversationId === "") {
+            root.resetPreviews();
             root.messages = [];
             root.truncated = false;
             return;
@@ -66,6 +67,7 @@ Item {
     }
 
     function openThread(conv) {
+        root.resetPreviews();
         if (!conv || !root.client.connected) return;
         root.loading = true;
         root.messages = [];
@@ -109,12 +111,50 @@ Item {
             if (dt !== 0) return dt;
             return String(a.id).localeCompare(String(b.id));
         });
+        // Keep the reader's place: follow the end only when already there, else hold an anchor
+        // message. Captured once per event-loop turn: a second merge before the reposition would
+        // see the reset view (contentY 0) and anchor on the first message.
+        if (root.scrollPending === null) {
+            var follow = msgList.atYEnd || root.messages.length === 0;
+            var ai = follow ? -1 : root.firstVisible(msgList.contentY + 1);
+            var anchorItem = ai >= 0 ? msgList.itemAtIndex(ai) : null;
+            root.scrollPending = {
+                follow: follow,
+                anchor: ai >= 0 ? root.messages[ai] : null,
+                offset: anchorItem ? msgList.contentY - anchorItem.y : 0
+            };
+        }
         root.messages = merged;
-        Qt.callLater(function() {
-            if (msgList.count > 0) {
-                msgList.positionViewAtEnd();
+        Qt.callLater(root.applyScroll);
+        previewTimer.restart();
+    }
+
+    property var scrollPending: null
+
+    function applyScroll() {
+        var p = root.scrollPending;
+        root.scrollPending = null;
+        if (!p || msgList.count === 0) return;
+        var list = root.messages;
+        if (p.follow || !p.anchor) {
+            msgList.positionViewAtEnd();
+            return;
+        }
+        var ni = -1;
+        for (var a = 0; a < list.length; a++) {
+            if (list[a].id === p.anchor.id) { ni = a; break; }
+        }
+        if (ni < 0) {
+            for (var b = 0; b < list.length; b++) {
+                if ((Number(list[b].timestamp_ms) || 0) >= (Number(p.anchor.timestamp_ms) || 0)) { ni = b; break; }
             }
-        });
+        }
+        if (ni < 0) {
+            msgList.positionViewAtEnd();
+            return;
+        }
+        msgList.positionViewAtIndex(ni, ListView.Beginning);
+        msgList.contentY += p.offset;
     }
 
     // State that outlives delegates (mergeMessages replaces the array on every event):
@@ -126,6 +166,97 @@ Item {
         if (patch === null) delete next[key];
         else next[key] = Object.assign({}, next[key] || ({}), patch);
         root.ui = next;
+    }
+
+    // Inline pictures: "p:<message>:<index>" -> {path, busy, failed, tries, req, gen}.
+    property int previewGen: 0
+    property int previewReq: 0
+    readonly property bool canPreview: root.client.features.indexOf("previews") >= 0
+    readonly property real previewMaxW: Style.space(320)
+    readonly property real previewMaxH: Style.space(240)
+
+    onVisibleChanged: previewTimer.restart()
+    onCanPreviewChanged: previewTimer.restart()
+    onMessagesChanged: previewTimer.restart()
+
+    function resetPreviews() {
+        root.previewGen++;
+        var next = ({});
+        var cancel = root.client.connected && root.canPreview;
+        for (var k in root.ui) {
+            if (k.indexOf("p:") !== 0) next[k] = root.ui[k];
+            // Queued jobs for the old view would hold the daemon's download slots.
+            else if (cancel && root.ui[k].busy) root.client.send("media.preview.cancel", root.previewParams(k), null);
+        }
+        root.ui = next;
+    }
+
+    // Index at content y; the gap between rows gives -1, so probe either side.
+    function firstVisible(y) {
+        var i = msgList.indexAt(0, y);
+        if (i < 0) i = msgList.indexAt(0, y + msgList.spacing + 1);
+        if (i < 0) i = msgList.indexAt(0, y - msgList.spacing - 1);
+        return i;
+    }
+
+    function visibleKeys() {
+        var keys = [];
+        if (!root.visible || !root.canPreview || !root.client.connected || root.messages.length === 0) return keys;
+        var first = root.firstVisible(msgList.contentY + 1);
+        var last = root.firstVisible(msgList.contentY + msgList.height - 1);
+        if (first < 0) first = 0;
+        if (last < 0) last = root.messages.length - 1;
+        for (var i = first; i <= last && i < root.messages.length; i++) {
+            var m = root.messages[i];
+            if (m.pending === true || m.failed === true || m.deleted === true) continue;
+            var atts = Array.isArray(m.attachments) ? m.attachments : [];
+            for (var j = 0; j < atts.length; j++) {
+                if (atts[j].preview === true) keys.push("p:" + m.id + ":" + j);
+            }
+        }
+        return keys;
+    }
+
+    function previewParams(key) {
+        var cut = key.lastIndexOf(":");
+        return { message: key.substring(2, cut), index: Number(key.substring(cut + 1)) };
+    }
+
+    function pumpPreviews() {
+        var want = ({});
+        var keys = root.visibleKeys();
+        for (var i = 0; i < keys.length; i++) want[keys[i]] = true;
+        keys.forEach(function(key) {
+            var old = root.ui[key];
+            if (old && (old.busy || old.failed || old.path)) return;
+            var req = ++root.previewReq;
+            var gen = root.previewGen;
+            root.setUi(key, { busy: true, req: req, gen: gen, tries: (old && old.tries) || 0 });
+            root.client.send("media.preview", root.previewParams(key), function(r) {
+                var e = root.ui[key];
+                if (!e || e.req !== req || e.gen !== gen || gen !== root.previewGen) return;
+                if (r.ok && r.data) {
+                    root.setUi(key, { path: String(r.data.path || ""), busy: false });
+                } else if (r.error && r.error.code === "not_found") {
+                    root.setUi(key, { failed: true, busy: false });
+                } else {
+                    var t = (e.tries || 0) + 1;
+                    root.setUi(key, { busy: false, tries: t, failed: t >= 2 });
+                    previewTimer.restart();
+                }
+            });
+        });
+        for (var k in root.ui) {
+            if (k.indexOf("p:") !== 0 || !root.ui[k].busy || want[k]) continue;
+            if (root.client.connected && root.canPreview) root.client.send("media.preview.cancel", root.previewParams(k), null);
+            root.setUi(k, { busy: false, req: 0 });
+        }
+    }
+
+    Timer {
+        id: previewTimer
+        interval: 200
+        onTriggered: root.pumpPreviews()
     }
 
     Component {
@@ -273,7 +404,13 @@ Item {
             root.typingPeer = started ? String(name || I18n.t("gmessages.someone", "Someone")) : "";
         }
 
+        function onConnectedChanged() {
+            if (!root.client.connected) root.resetPreviews();
+            else previewTimer.restart();
+        }
+
         function onStateChanged() {
+            if (root.client.state !== "ready") root.resetPreviews();
             if (root.client.state === "ready" && root.conversationId !== "") {
                 root.openThread(root.conversationId);
             }
@@ -407,6 +544,9 @@ Item {
                 spacing: Style.space(8)
                 model: root.messages
 
+                onContentYChanged: previewTimer.restart()
+                onHeightChanged: previewTimer.restart()
+
                 delegate: Item {
                     id: bubbleRow
                     required property var modelData
@@ -519,6 +659,64 @@ Item {
                                     readonly property var st: root.ui[att.key] || ({})
 
                                     HoverHandler { onHoveredChanged: bubbleRow.attHover = hovered }
+
+                                    Item {
+                                        id: box
+                                        visible: root.canPreview && att.modelData.preview === true && !bubbleRow.isDeleted
+
+                                        readonly property string key: "p:" + bubbleRow.modelData.id + ":" + att.index
+                                        readonly property var st: root.ui[box.key] || ({})
+                                        readonly property real iw: Number(att.modelData.width) || 0
+                                        readonly property real ih: Number(att.modelData.height) || 0
+                                        readonly property real sc: (box.iw > 0 && box.ih > 0)
+                                            ? Math.min(root.previewMaxW / box.iw, root.previewMaxH / box.ih, 1) : 1
+                                        readonly property real bw: (box.iw > 0 && box.ih > 0) ? Math.round(box.iw * box.sc) : root.previewMaxW
+                                        readonly property real bh: (box.iw > 0 && box.ih > 0) ? Math.round(box.ih * box.sc) : Style.space(180)
+
+                                        implicitWidth: box.bw
+                                        implicitHeight: box.bh
+                                        Layout.maximumWidth: msgList.width * 0.78 - 2 * root.theme.padX
+
+                                        Rectangle {
+                                            anchors.fill: parent
+                                            radius: Style.cornerRadius
+                                            color: Commons.Color.muted
+                                            opacity: 0.15
+                                        }
+
+                                        Text {
+                                            anchors.centerIn: parent
+                                            visible: box.st.failed === true
+                                            textFormat: Text.PlainText
+                                            text: "\u{F02E9}"
+                                            color: Commons.Color.muted
+                                            font.family: root.theme.family
+                                            font.pixelSize: root.theme.body
+                                        }
+
+                                        Image {
+                                            anchors.fill: parent
+                                            asynchronous: true
+                                            cache: false
+                                            autoTransform: true
+                                            fillMode: Image.PreserveAspectFit
+                                            sourceSize: Qt.size(2 * box.bw, 2 * box.bh)
+                                            source: box.st.path ? "file://" + box.st.path : ""
+                                            onStatusChanged: {
+                                                if (status === Image.Error && box.st.path) {
+                                                    var t = (box.st.tries || 0) + 1;
+                                                    root.setUi(box.key, { path: "", busy: false, tries: t, failed: t >= 2 });
+                                                    previewTimer.restart();
+                                                }
+                                            }
+                                        }
+
+                                        MouseArea {
+                                            anchors.fill: parent
+                                            cursorShape: Qt.PointingHandCursor
+                                            onClicked: root.mediaRequest("media.open", String(bubbleRow.modelData.id), att.index)
+                                        }
+                                    }
 
                                     RowLayout {
                                         Layout.fillWidth: true
