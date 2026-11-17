@@ -33,6 +33,7 @@ pub enum ErrorCode {
     PhoneOffline,
     SendRejected,
     SendUncertain,
+    Attachment,
     NotFound,
     BadRequest,
     UnknownMethod,

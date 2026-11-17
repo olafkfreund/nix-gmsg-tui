@@ -406,6 +406,15 @@ impl Sync {
         let (status, message) = match outcome {
             SendOutcome::Sent(message) => (proto::SendStatus::Sent, message),
             SendOutcome::Accepted(message) => (proto::SendStatus::Accepted, message),
+            SendOutcome::Attachment(message) => {
+                return vec![proto::Out::Reply {
+                    rid: id,
+                    result: Err(proto::ErrorBody {
+                        code: proto::ErrorCode::Attachment,
+                        message,
+                    }),
+                }];
+            }
             SendOutcome::Unavailable(message) => {
                 return vec![proto::Out::Reply {
                     rid: id,
@@ -1196,7 +1205,7 @@ impl Sync {
             conversation,
             text,
             reply: reply_to,
-            attachments: Vec::new(),
+            files: Vec::new(),
         });
     }
 

@@ -4,7 +4,9 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io;
+use std::fs::OpenOptions;
+use std::io::{self, Read};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -125,6 +127,7 @@ pub enum Event {
 pub enum SendOutcome {
     Sent(Message),
     Accepted(Message),
+    Attachment(String),
     Unavailable(String),
     Rejected(String),
     Uncertain(String),
@@ -161,7 +164,7 @@ pub enum Command {
         conversation: String,
         text: String,
         reply: Option<String>,
-        attachments: Vec<Attachment>,
+        files: Vec<PathBuf>,
     },
     /// The conversation is read up to this message.
     Read {
@@ -1136,10 +1139,10 @@ async fn run_commands(state: Rc<State>, mut commands: UnboundedReceiver<Command>
                 conversation,
                 text,
                 reply,
-                attachments,
+                files,
             } => {
                 tokio::task::spawn_local(async move {
-                    let outcome = send(&state, &conversation, text, reply, attachments).await;
+                    let outcome = send(&state, &conversation, text, reply, files).await;
                     state.emit(Event::Sent {
                         id,
                         conversation,
@@ -1384,14 +1387,26 @@ async fn fetch(state: Rc<State>, ids: Vec<String>) {
     futures::future::join_all(workers).await;
 }
 
-/// Sends `text` and `attachments` to `conversation`, from the SIM it uses.
+/// Sends `text` and `files` to `conversation`, from the SIM it uses.
 async fn send(
     state: &State,
     conversation: &str,
     text: String,
     reply: Option<String>,
-    attachments: Vec<Attachment>,
+    files: Vec<PathBuf>,
 ) -> SendOutcome {
+    let attachments = if files.is_empty() {
+        Vec::new()
+    } else {
+        match tokio::task::spawn_blocking(move || read_files(&files, MEDIA_MAX)).await {
+            Ok(Ok(attachments)) => attachments,
+            Ok(Err(message)) => return SendOutcome::Attachment(message),
+            Err(error) => {
+                tracing::debug!(%error, "attachment read task failed");
+                return SendOutcome::Attachment("attachment: cannot read".into());
+            }
+        }
+    };
     let client = match state.client() {
         Ok(client) => client,
         Err(error) => return SendOutcome::Unavailable(error),
@@ -1401,17 +1416,24 @@ async fn send(
         Err(error) => return SendOutcome::Unavailable(error),
     };
     let mut outgoing = gm::OutgoingMessage::new(&c, text.clone());
+    let mut sent_media = Vec::new();
     for a in &attachments {
         let name = a.name.clone().unwrap_or_default();
-        let media = match client.upload_media(&a.data, &name, &a.content_type).await {
+        let mut media = match client.upload_media(&a.data, &name, &a.content_type).await {
             Ok(media) => media,
             Err(error) => {
-                return SendOutcome::Unavailable(format!(
-                    "cannot upload {}: {error}",
-                    a.content_type
-                ));
+                log::warn("attachment upload failed");
+                tracing::debug!(%name, %error, "attachment upload failed");
+                return SendOutcome::Attachment(format!("{name}: upload failed"));
             }
         };
+        if let (Some(width), Some(height)) = (a.width, a.height) {
+            media.dimensions = Some(gm::Dimensions {
+                width: width as i64,
+                height: height as i64,
+            });
+        }
+        sent_media.push(serde_json::to_value(stored_medium(&media, None)).unwrap_or_default());
         outgoing = outgoing.with_media(media);
     }
     if outgoing.text.is_empty() && outgoing.media.is_empty() {
@@ -1470,7 +1492,7 @@ async fn send(
         sender: String::new(),
         text,
         quote: reply,
-        media: Vec::new(),
+        media: sent_media,
         reactions: Vec::new(),
         deleted: false,
         failed: false,
@@ -1479,6 +1501,120 @@ async fn send(
 
 /// The largest medium downloaded, declared or real.
 const MEDIA_MAX: usize = 100 * 1024 * 1024;
+
+fn file_name(path: &Path) -> String {
+    let name: String = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .chars()
+        .filter(|c| {
+            !c.is_control()
+                && !matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}')
+        })
+        .collect();
+    if name.is_empty() { "file".into() } else { name }
+}
+
+fn mime_for(name: &str) -> &'static str {
+    const MIME: &[(&str, &str)] = &[
+        ("jpg", "image/jpeg"),
+        ("jpeg", "image/jpeg"),
+        ("png", "image/png"),
+        ("gif", "image/gif"),
+        ("webp", "image/webp"),
+        ("heic", "image/heic"),
+        ("heif", "image/heif"),
+        ("bmp", "image/bmp"),
+        ("mp4", "video/mp4"),
+        ("3gp", "video/3gpp"),
+        ("mov", "video/quicktime"),
+        ("webm", "video/webm"),
+        ("mkv", "video/x-matroska"),
+        ("mp3", "audio/mpeg"),
+        ("m4a", "audio/mp4"),
+        ("aac", "audio/aac"),
+        ("ogg", "audio/ogg"),
+        ("opus", "audio/ogg"),
+        ("amr", "audio/amr"),
+        ("wav", "audio/wav"),
+        ("pdf", "application/pdf"),
+        ("txt", "text/plain"),
+        ("vcf", "text/vcard"),
+        ("zip", "application/zip"),
+    ];
+    let ext = name.rsplit_once('.').map_or("", |(_, ext)| ext);
+    MIME.iter()
+        .find(|(key, _)| ext.eq_ignore_ascii_case(key))
+        .map_or("application/octet-stream", |(_, mime)| mime)
+}
+
+fn read_files(paths: &[PathBuf], max: usize) -> Result<Vec<Attachment>, String> {
+    let mut total = 0usize;
+    let mut attachments = Vec::with_capacity(paths.len());
+    for path in paths {
+        let name = file_name(path);
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+            .map_err(|error| {
+                tracing::debug!(path = %path.display(), %error, "attachment refused");
+                format!("{name}: cannot read")
+            })?;
+        let meta = file.metadata().map_err(|error| {
+            tracing::debug!(path = %path.display(), %error, "attachment refused");
+            format!("{name}: cannot read")
+        })?;
+        if !meta.is_file() {
+            let error = "not a file";
+            tracing::debug!(path = %path.display(), %error, "attachment refused");
+            return Err(format!("{name}: {error}"));
+        }
+        if meta.len() == 0 {
+            let error = "empty";
+            tracing::debug!(path = %path.display(), %error, "attachment refused");
+            return Err(format!("{name}: {error}"));
+        }
+        let remaining = max - total;
+        let mut data = Vec::new();
+        (&file)
+            .take(remaining as u64 + 1)
+            .read_to_end(&mut data)
+            .map_err(|error| {
+                tracing::debug!(path = %path.display(), %error, "attachment refused");
+                format!("{name}: cannot read")
+            })?;
+        if data.len() > remaining {
+            let error = "too large (over 100 MiB in all)";
+            tracing::debug!(path = %path.display(), %error, "attachment refused");
+            return Err(format!("{name}: {error}"));
+        }
+        if data.is_empty() {
+            let error = "empty";
+            tracing::debug!(path = %path.display(), %error, "attachment refused");
+            return Err(format!("{name}: {error}"));
+        }
+        total += data.len();
+        let content_type = mime_for(&name).to_string();
+        let (width, height) = if content_type.starts_with("image/") {
+            imagesize::blob_size(&data).map_or((None, None), |s| {
+                (Some(s.width as u32), Some(s.height as u32))
+            })
+        } else {
+            (None, None)
+        };
+        attachments.push(Attachment {
+            content_type,
+            name: Some(name),
+            data,
+            width,
+            height,
+            full: true,
+        });
+    }
+    Ok(attachments)
+}
 
 /// Fails "too large" if the declared or the real size is over `MEDIA_MAX`.
 fn check_size(declared: i64, actual: usize) -> Result<(), String> {
@@ -1893,6 +2029,10 @@ pub mod log {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::os::unix::ffi::OsStrExt;
+    use std::sync::mpsc;
+
     use base64::Engine;
     use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 
@@ -1905,6 +2045,91 @@ mod tests {
         assert!(check_size(MEDIA_MAX as i64 + 1, 0).is_err());
         assert_eq!(check_size(0, MEDIA_MAX + 1).unwrap_err(), "too large");
         assert!(check_size(-1, 0).is_ok());
+    }
+
+    fn test_dir() -> PathBuf {
+        let mut random = [0u8; 8];
+        getrandom::fill(&mut random).unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("gmessages-files-{:x}", u64::from_ne_bytes(random)));
+        fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn read_files_checks_names_types_dimensions_and_total_size() {
+        const PNG: &[u8] = &[
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52, 0,
+            0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 0x1f, 0x15, 0xc4, 0x89, 0, 0, 0, 10, 0x49, 0x44,
+            0x41, 0x54, 0x78, 0x9c, 0x63, 0, 1, 0, 0, 5, 0, 1, 0xa5, 0xf6, 0x45, 0x40, 0, 0, 0, 0,
+            0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ];
+        assert_eq!(PNG.len(), 67);
+        let dir = test_dir();
+        let png = dir.join("tiny.PNG");
+        fs::write(&png, PNG).unwrap();
+        let image = read_files(&[png], MEDIA_MAX).unwrap().remove(0);
+        assert_eq!(image.name.as_deref(), Some("tiny.PNG"));
+        assert_eq!(image.content_type, "image/png");
+        assert_eq!((image.width, image.height), (Some(1), Some(1)));
+        assert!(image.full);
+
+        let jpeg = dir.join("photo.JPEG");
+        fs::write(&jpeg, b"jpeg").unwrap();
+        let image = read_files(&[jpeg], MEDIA_MAX).unwrap().remove(0);
+        assert_eq!(image.name.as_deref(), Some("photo.JPEG"));
+        assert_eq!(image.content_type, "image/jpeg");
+        assert_eq!(image.data.len(), 4);
+
+        let unknown = dir.join("x.unknown");
+        fs::write(&unknown, b"a").unwrap();
+        assert_eq!(
+            read_files(&[unknown], 10).unwrap()[0].content_type,
+            "application/octet-stream"
+        );
+
+        let first = dir.join("first.txt");
+        let second = dir.join("second.txt");
+        fs::write(&first, b"123456").unwrap();
+        fs::write(&second, b"123456").unwrap();
+        assert_eq!(read_files(std::slice::from_ref(&first), 10).unwrap()[0].data.len(), 6);
+        assert_eq!(
+            read_files(&[first, second], 10).unwrap_err(),
+            "second.txt: too large (over 100 MiB in all)"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn read_files_refuses_bad_handles_and_cleans_error_names() {
+        let dir = test_dir();
+        assert_eq!(
+            read_files(std::slice::from_ref(&dir), 10).unwrap_err(),
+            format!("{}: not a file", file_name(&dir))
+        );
+        let empty = dir.join("empty.txt");
+        fs::write(&empty, []).unwrap();
+        assert_eq!(read_files(&[empty], 10).unwrap_err(), "empty.txt: empty");
+        let missing = dir.join("bad\u{202E}\n.txt");
+        assert_eq!(
+            read_files(&[missing], 10).unwrap_err(),
+            "bad.txt: cannot read"
+        );
+
+        let fifo = dir.join("pipe");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_files(&[fifo], 10));
+        });
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5))
+                .expect("FIFO read blocked")
+                .unwrap_err(),
+            "pipe: not a file"
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     fn one_to_one() -> gm::Conversation {
