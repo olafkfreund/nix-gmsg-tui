@@ -13,7 +13,7 @@ Answers to the intent's open questions, as approved:
 - the uploaded preview comes first, then the inline preview, and never the full file;
 - animated images show their first frame;
 - no video thumbnails;
-- caps: about 240 logical px tall, 2 MiB, 40 MP, a 64 MiB cache and 2 downloads at a time;
+- caps: about 240 logical px tall, 2 MiB, 40 MP, a 64 MiB cache, 2 downloads at a time;
 - no re-encoding in the daemon.
 
 The model is the avatar path that already exists (`src/phone.rs:1046` `avatars`,
@@ -21,238 +21,308 @@ The model is the avatar path that already exists (`src/phone.rs:1046` `avatars`,
 bytes, checks them by content and size, writes a private file, and QML shows it with
 `Image`.
 
+The key simplification is that **a picture box never changes height once shown.** The
+daemon tells the plugin up front which attachments have a preview at all, and their
+size when known. The box is drawn at its final size, and stays that size while loading,
+when loaded and when the download fails (then it shows a muted "no preview" glyph; the
+name row underneath is always there). Loading therefore never moves the list, which
+removes most of the scroll-anchoring problem.
+
 ```
-Thread delegate in view ─media.preview {message,index}─▶ serve ─▶ Sync::preview
-  Sync: cache hit? reply path │ inline-only? check + write + reply │ else queue job
-  queue (≤32, ≤2 running) ─▶ phone::Command::Preview{id, thumb_id, thumb_key}
-  phone: stream download, stop at 2 MiB ─▶ Event::Previewed{id, bytes|error}
-  Sync: check image ─▶ write media_dir/previews/<hash>.<ext> ─▶ evict to 64 MiB ─▶ reply path
-Thread delegate destroyed ─media.preview.cancel─▶ drops the job if still queued
+Thread (in-view set) ─media.preview {message,index}─▶ serve ─▶ Sync::preview
+  Sync: cache hit (file exists)? reply │ join existing job │ queue (≤32) │ run ≤2
+  phone::Command::Preview{id, thumb_id, thumb_key} ─▶ stream ≤2 MiB ─▶ Event::Previewed
+  Sync: check image (else inline fallback) ─▶ previews/<hash>.<ext> ─▶ evict to 64 MiB ─▶ reply
+Thread (debounced) ─media.preview.cancel {message,index}─▶ drops this connection's waiters
 ```
 
 ### 1. Protocol (`src/proto.rs`)
 
-- `FEATURES` (`:12`) becomes `["attachments", "previews"]`.
-- `Attachment` (`:131`) gains `width` and `height` (`i64`, with
-  `#[serde(default, skip_serializing_if = "is_zero")]`), filled from `phone::Medium` in
-  `Message::from_phone` (`:228-240`). The plugin uses them to size the bubble before the
-  picture loads. Old plugins ignore them.
-- New methods, both taking the existing `MediaParams { message, index }` (`:380`):
+- `FEATURES` becomes `["attachments", "previews"]`.
+- `Attachment` (`:131`) gains three fields, filled in `Message::from_phone` (`:228`), all
+  `#[serde(default, skip_serializing_if = …)]`:
+  - `width` and `height` (`i64`) from `Medium`, sent only when both are in
+    `1..=16384`;
+  - `preview: bool`, true when the mime is `image/*` and `thumb_id` or `inline` is
+    non-empty.
+
+  Old plugins ignore all three.
+- New methods taking the existing `MediaParams { message, index }`:
   - `media.preview` replies with `MediaData { path }`;
   - `media.preview.cancel` replies with `{}`.
 - Errors use the existing codes:
-  - `not_found` for "no such attachment" and "no preview" (not an image, no preview
-    bytes, or bytes that fail the checks);
-  - `phone_offline` when the phone isn't ready;
-  - `busy` when the queue is full or the job was cancelled.
+  - `not_found`: no such attachment, or no usable preview;
+  - `phone_offline`: not ready, or the download failed with no inline fallback;
+  - `busy`: the queue is full, the job was cancelled, or it waited too long in the queue.
 
-### 2. Daemon request handling (`src/serve.rs:1127`)
+### 2. Daemon request handling (`src/serve.rs`, next to `media.open` at `:1127`)
 
-- `media.preview` follows the `media.open` arm: a pending entry with a 60 s deadline,
-  then `self.sync…preview(rid, &message, index)`.
-- `media.preview.cancel` calls `sync.cancel_preview(&message, index)` and replies `{}`
-  straight away.
+- `media.preview` adds a pending entry with a 60 s deadline, then calls
+  `sync.preview(rid, &message, index)`.
+- `media.preview.cancel`: serve collects the rids in `self.pending` whose `conn` is this
+  connection, calls `sync.cancel_preview(&message, index, &rids)` and replies `{}`.
+  That way one connection can never cancel another's request.
+- Both refuse an empty `message` with `bad_request`.
 
 ### 3. Sync: the preview path (`src/sync.rs`)
 
-New state on `Sync`, initialised in `new`:
-- `previews: HashMap<(String, u32), PathBuf>`: files written in this run;
-- `preview_jobs: VecDeque<PreviewJob>`, where `PreviewJob { message, index, token,
-  thumb_id, thumb_key }`;
+**State:**
+- `previews: HashMap<(String, u32), PathBuf>`;
+- `preview_jobs: VecDeque<PreviewJob>`;
 - `preview_running: HashMap<u64, PreviewJob>`, keyed by token;
-- `preview_waiters: HashMap<(String, u32), Vec<u64>>`: the rids waiting on one preview.
+- `preview_waiters: HashMap<(String, u32), Vec<u64>>`.
 
-`pub fn preview(&mut self, rid, message, index) -> Vec<Out>`:
-1. Find the stored message and its `index`-th valid `Medium`, filtered exactly as
-   `media()` does (`:526-534`), so indexes match the plugin's list. If it is missing,
-   reply `not_found` "no such attachment".
-2. If `medium.mime` doesn't start with `image/`, reply `not_found` "no preview".
-3. **Cache hit:** `previews[(message, index)]` exists and the file is still there. Reply
-   with the path.
-4. **Inline only:** if `thumb_id` is empty and `inline` isn't, check and write
-   synchronously (step 6) and reply. If both are empty, reply `not_found` "no preview".
-   The full file is never requested.
-5. **Uploaded preview:** if not ready, reply `phone_offline`. Otherwise add `rid` to
-   `preview_waiters[(message, index)]`, and queue a job if this key has no job queued or
-   running yet (de-duplication). The queue holds at most 32 jobs; when it is full, reply
-   `busy`. Then `pump_previews()`: while fewer than 2 are running, pop a job and send
-   `phone::Command::Preview { id: token, thumb_id, thumb_key }`.
-6. `fn accept_preview(&mut self, message, index, bytes) -> Result<PathBuf, &'static str>`:
-   - `image_kind(&bytes)`, a magic-byte check split out of `save_avatar` (`:1324-1332`),
-     plus GIF (`GIF87a` / `GIF89a`). It gives `jpg`, `png`, `webp` or `gif`, otherwise
-     "no preview".
-   - The length must be ≤ `PREVIEW_MAX` (2 MiB).
-   - `imagesize::blob_size` must succeed, with `width * height ≤ 40_000_000` and each
-     side ≤ 16384.
-   - Write it with `write_media` to
-     `media_dir/previews/<sha256(message ‖ 0 ‖ index ‖ "preview")>.<ext>`, creating the
-     directory with `paths::create_private_dir` if needed. The name is distinct from
-     `media.open`'s full/`-preview` files (`:576`), so the two never collide.
-   - Record it in `previews`, then `evict_previews(&written)`.
-   `save_avatar` keeps its own caps (256 KiB, 1024 px) and calls `image_kind` for the
-   format.
-7. `fn evict_previews(&mut self, keep: &Path)`: list `media_dir/previews`, and while the
-   total is over 64 MiB, delete the oldest file by mtime other than `keep`, and drop it
-   from `previews`. The plugin requests again only when a delegate is created, so an
-   evicted visible picture stays drawn (Qt holds the decoded image) and there's no
-   reload loop.
-8. `phone::Event::Previewed { id, result: Result<Vec<u8>, String> }`:
-   - take the job from `preview_running`;
-   - on `Ok`, run `accept_preview`;
-   - reply to every rid in `preview_waiters.remove(&key)`: the path, or `not_found` "no
-     preview" (bad bytes), or `phone_offline` (download error);
-   - then `pump_previews()`.
+`PreviewJob { key, token, thumb_id, thumb_key, inline: Vec<u8>, queued_at: Instant }`.
+Tokens come from the existing `next_token` counter.
 
-   A token not in `preview_running` (left from an old run) is ignored.
-9. `pub fn cancel_preview(&mut self, message, index)`: if the key's job is still in
-   `preview_jobs`, remove it, and reply `busy` "cancelled" to its waiters. A running
-   job finishes, because cancelling a download mid-stream isn't worth the code, and only
-   2 can run.
-10. `forget(rid)` (`:686`) removes `rid` from every `preview_waiters` list. A job with no
-    waiters left still finishes, and its file is reused.
-11. On unpair or a store reset, the new `Sync` starts empty and `clear_media` already
-    removes `media_dir` (`:804`). The `previews` map always matches the files on disk,
-    because each lookup checks the file exists.
+**`preview(rid, message, index)`:**
+1. Find the medium with the same filter `media()` uses (`:518-523`), so indexes match
+   the plugin. If it is missing, reply `not_found`. If it isn't `image/*`, or has
+   neither a `thumb_id` nor `inline`, reply `not_found` too.
+2. Cache hit: the `previews` entry exists **and** the file exists. Reply with its path.
+   If the entry's file is gone, drop the entry and go on.
+3. Inline only (`thumb_id` empty): `accept_preview(inline)`, then reply with the path, or
+   `not_found`.
+4. Not ready: reply `phone_offline`.
+5. **Join first:** if a job for the key is queued or running, push `rid` to its waiters
+   and return.
+6. **Capacity:** if `preview_jobs.len() == 32`, reply `busy` without storing anything.
+7. Otherwise store the waiter, queue the job and call `pump_previews()`.
+
+**`pump_previews()`:**
+- Drop queued jobs that have no waiters left. Drop those queued for more than 45 s,
+  replying `busy` to their waiters, so the 60 s pending deadline is never reached while
+  a job is queued.
+- Then, while fewer than 2 are running, pop a job and send
+  `Command::Preview { id: token, thumb_id, thumb_key }`. If `Commands::send` returns
+  false (`src/phone.rs:420`), the job doesn't go into `preview_running`; reply
+  `phone_offline` to its waiters, so a slot can't be held for ever.
+
+**`accept_preview(key, bytes) -> Option<PathBuf>`:**
+- `image_kind(&bytes)` is the magic-byte check split out of `save_avatar` (`:1324-1332`),
+  plus `GIF87a` / `GIF89a`. It gives `jpg`, `png`, `webp`, `gif` or `None`.
+- The length must be ≤ 2 MiB.
+- `imagesize::blob_size` must succeed with `0 < w, h ≤ 16384` and `w * h ≤ 40_000_000`
+  (checked in `u64`).
+- What this proves: the container's **header** is one of four formats and declares a
+  bounded canvas. It does not prove the body is well formed. Truncated or crafted
+  frames still reach Qt's decoder, which is the residual risk the intent accepted.
+  Tests use real GIF and WebP fixtures to confirm `imagesize` reads the logical screen
+  or canvas size.
+- On success, `write_media` writes the file to
+  `media_dir/previews/<sha256(message ‖ 0 ‖ index ‖ "preview")>.<ext>`, creating the
+  directory with `paths::create_private_dir`. The name never collides with
+  `media.open`'s files. The function records the entry and runs `evict_previews`.
+- `save_avatar` keeps its own caps and calls `image_kind`.
+
+**`evict_previews(keep, budget)`:**
+- List the directory and sort by `(mtime, name)` for a stable order.
+- While the total is over the budget (64 MiB in production; tests pass a smaller one),
+  remove the oldest file other than `keep`, and its `previews` entry.
+- A failed removal is logged at `debug`, its size is still counted, and the loop moves
+  to the next file. If the budget can't be reached, that's logged once at `warn` with
+  no paths.
+
+**`Event::Previewed { id, result }`:** take the job from `preview_running`; an unknown
+token is ignored, which makes late results after a reset harmless.
+- `Ok(bytes)` and `accept_preview` succeeds: reply the path to every waiter of the key.
+- Otherwise, if `job.inline` isn't empty and `accept_preview(inline)` succeeds: reply
+  that path. This is the fallback from the uploaded preview to the inline one.
+- Otherwise reply `phone_offline` (a download error) or `not_found` (bad bytes).
+- Then `pump_previews()`.
+
+**`cancel_preview(key, rids)`:** remove those rids from the key's waiters and reply
+`busy` "cancelled" to each. A queued job left with no waiters is dropped. A running one
+finishes, and its file is cached for next time.
+
+**`forget(rid)` (`:686`):** also removes the rid from every waiter list. A queued job
+with no waiters left is then dropped at the next `pump_previews()`.
+
+**`reset_media()` (`:803`), the unpair and store-reset path:** it also clears
+`previews`, `preview_jobs` and `preview_waiters`, and replies `busy` to those waiters,
+as it already does for the media waiters. It also clears `preview_running`, so results
+arriving later find no token and are dropped. `clear_media` already removes the files.
 
 ### 4. Phone (`src/phone.rs`)
 
-- New `Command::Preview { id, thumb_id: String, thumb_key: Vec<u8> }`, dispatched in
-  `run_commands` next to `Command::Download` (`:1118`):
-  - `client.download_media_stream(&thumb_id, &thumb_key)` (`gmessages-proto/src/client.rs:630`);
-  - then `next_chunk()` until the end, stopping with an error as soon as the total is
-    over `PREVIEW_MAX`, so a lying server can't make us buffer more;
-  - the whole thing runs under `tokio::time::timeout(30 s)`;
-  - it emits `Event::Previewed { id, result }`.
+- New `Command::Preview { id, thumb_id, thumb_key }`, dispatched next to
+  `Command::Download` (`:1118`). It runs under `tokio::time::timeout(30 s)`:
+  - `client.download_media_stream(..)` (`gmessages-proto/src/client.rs:630`);
+  - for each `next_chunk()`, it checks `total + chunk.len() > 2 MiB` **before**
+    extending the buffer, and fails without extending if so;
+  - only `Ok(None)`, the end of stream after the decryptor's `finish`, counts as
+    success.
+- It emits `Event::Previewed { id, result: Result<Vec<u8>, String> }`. The error text is
+  generic, with the detail at `debug`.
+- It never calls `full()` and never writes to the store.
+- Memory bound: the accepted buffer is ≤ 2 MiB. One transport chunk and the decryptor
+  state are extra and bounded by reqwest's chunking, not by this code. That is noted,
+  not engineered around.
 
-  It never calls `full()` and never writes to the store.
-- The error string is generic ("preview download failed"); the detail goes to
-  `tracing::debug!`.
+### 5. Plugin (`plugin/Thread.qml`; `Client.qml` unchanged)
 
-### 5. Plugin
+**State**, owned by `Thread` and never by delegates:
+- `root.ui["p:<message>:<index>"] = { path, busy, failed, tries, gen }`;
+- `property int previewGen`: incremented by `openThread`, by closing (the
+  `conversationId === ""` branch, `:57`), when `client.connected` turns false, and when
+  `client.state` leaves `"ready"` (unpair goes through `login`). Each increment also
+  removes every `"p:"` entry. Clearing a path unloads its `Image`.
+- `property var inView: ({})`: the keys currently in view.
+- `readonly property bool canPreview: client.features.indexOf("previews") >= 0`.
 
-- **`plugin/Client.qml`:** nothing new. `features` already comes from `hello` and is
-  reset on disconnect.
-- **`plugin/Thread.qml`:**
-  - `readonly property bool canPreview: client.features.indexOf("previews") >= 0`.
-  - Preview state lives outside delegates, in `root.ui`, keyed
-    `"p:" + message + ":" + index`, as `{ path, busy, failed, tries }`. Delegates are
-    rebuilt on every merge (`:120`).
-  - **The image box,** placed above the name row inside each attachment's
-    `ColumnLayout` (`:511`):
-    - shown when `canPreview` and the attachment is `image/*`, and the message is
-      neither `pending`, `failed` nor `deleted`;
-    - its size is fixed before loading. With `width` and `height` known, the height is
-      `min(240, h)` and the width is the matching aspect width, capped to the bubble's
-      `78%` width minus padding (recomputing the height to keep the aspect). Without
-      them, the box is `240 × 180`;
-    - it holds an `Image` with `asynchronous: true`, `fillMode: PreserveAspectFit`,
-      `autoTransform: true`, `cache: false`,
-      `sourceSize: Qt.size(box.width * 2, box.height * 2)` (enough for HiDPI, and caps
-      the decode), and `source` set to `"file://" + path` once it is known;
-    - while loading, the box is a muted rectangle;
-    - clicking it calls `root.mediaRequest("media.open", …)`, exactly as Open does;
-    - an `Image` (not `AnimatedImage`) shows the first frame of a GIF or animated WebP.
-  - **Pending messages** show the box with a muted placeholder and request nothing. The
-    send-attachments `Accepted` fallback carries the media with its dimensions, so the
-    box already has its final size. The confirmed message comes with a new id and loads
-    then.
-  - **When to request:** a delegate is in view when its rectangle intersects
-    `msgList.contentY … contentY + height`. `msgList.cacheBuffer` is set to 0, so
-    delegates exist only near the viewport. When `inView` becomes true and there is no
-    state for the key, the delegate sends `media.preview`. On `Component.onDestruction`
-    of a delegate whose key is still `busy`, it sends `media.preview.cancel`.
-  - **Replies:**
-    - a reply for a conversation that is no longer open is ignored. The conversation id
-      is captured with the request, like `submit()` does in send-attachments;
-    - `path`: stored, and the image loads;
-    - `not_found`: `{ failed: true }`, and the box collapses to nothing, leaving the
-      name row as today;
-    - `busy` or `phone_offline`: retried once after 5 s if still in view (`tries < 2`),
-      otherwise `failed`;
-    - an `Image.Error` status also marks it `failed`.
-  - **Clearing state:** `"p:"` entries are cleared on `openThread` of another
-    conversation and when `client.connected` turns false. Unpair also disconnects.
-  - **Scroll position:**
-    - `mergeMessages` (`:86-118`) reads `var follow = msgList.atYEnd || msgList.count === 0`
-      before replacing the array, and calls `positionViewAtEnd()` only when `follow` is
-      true or `dropPending` is set (the initial load). That keeps the reading position
-      when updates arrive while the user scrolls back;
-    - while following, a height change in the last delegate (a box collapsing on
-      failure) calls `positionViewAtEnd` again;
-    - a box collapsing above the viewport isn't possible, since requests come only from
-      delegates in view.
+**Geometry**, which doesn't depend on the bubble or the window, so `sourceSize` is fixed
+per box:
+- `previewMaxW = Style.space(320)`, `previewMaxH = Style.space(240)`;
+- with valid `width` and `height` (both > 0): `scale = min(maxW/w, maxH/h, 1)` and
+  `box = (round(w*scale), round(h*scale))`; otherwise the box is `maxW × Style.space(180)`;
+- the box also gets `Layout.maximumWidth: msgList.width * 0.78 - 2 * padX`. In a narrow
+  window it shrinks, and the `Image` inside fits with `PreserveAspectFit`;
+- the box sets its own `implicitWidth` and `implicitHeight`, which feed
+  `bubbleContent.implicitWidth` (`:449`), not the other way round.
+
+**The box**, inside each attachment's `ColumnLayout` (`:511`), above the name row:
+- shown when `canPreview && att.preview === true && !deleted`;
+- for `pending` or `failed` messages it shows only the muted placeholder and never
+  requests. A pending message's later confirmed copy has a new id and requests then;
+- it holds an `Image` with `asynchronous: true`, `cache: false`, `autoTransform: true`,
+  `fillMode: PreserveAspectFit`, and `sourceSize: Qt.size(2 * box.w, 2 * box.h)` (fixed
+  per box);
+- its `source` is `"file://" + path` once the key has a path, else `""`. On
+  `Image.Error` with a path, the plugin clears the path and asks again once
+  (`tries < 2`). That covers a file evicted under a rebuilt delegate. After that, the
+  state is `failed`;
+- while loading, the box shows a muted fill; when `failed`, the same box shows a muted
+  glyph. Its size never changes;
+- clicking it runs `root.mediaRequest("media.open", …)`, as Open does;
+- an `Image`, not an `AnimatedImage`, shows the first frame of an animated image.
+
+**When to request.** Each delegate keeps
+`inViewNow = root.visible && bubbleRow.y + bubbleRow.height > msgList.contentY && bubbleRow.y < msgList.contentY + msgList.height`
+(`bubbleRow.y` is in ListView content coordinates, `:410`). On a change, it writes or
+removes its preview keys in `root.inView`, through a helper that assigns a new object.
+All attachments of a message in view count as in view. A message with several pictures
+is one bubble, and requesting them all is fine at 2 at a time.
+
+A `Timer` in `Thread` (200 ms, restarted on every `inView` change):
+- for each key in view with no state: send `media.preview` with the captured
+  `{ conv, gen, key }`, and set `busy`, `tries + 1` and `gen`;
+- for each `busy` key not in view: send `media.preview.cancel`, then remove the entry.
+
+Delegate rebuilds within 200 ms don't cancel anything.
+
+**Replies:** apply only when `gen === root.previewGen`, the entry still exists and its
+`gen` matches. That handles A → B → A.
+- `path`: stored;
+- `not_found`: `failed`;
+- `busy`, `phone_offline` or `timeout`: if `tries < 2` and the key is still in view,
+  clear `busy` so the next timer tick asks again; otherwise `failed`;
+- a reply to a cancel is ignored.
+
+All sends check `client.connected && canPreview` first.
+
+**Scroll position.** `mergeMessages` (`:86-118`) anchors on the first visible message,
+not on the end. Before replacing the array it computes:
+- `follow = msgList.atYEnd || root.messages.length === 0`;
+- `anchor`, the id of the delegate at `msgList.indexAt(0, msgList.contentY)`;
+- `offset = contentY - item.y`.
+
+After replacing the array:
+- if `follow`, `positionViewAtEnd()`;
+- otherwise, find the anchor's new index, `positionViewAtIndex(i, ListView.Beginning)`,
+  then `contentY += offset`.
+
+The current unconditional `positionViewAtEnd` goes. This covers history updates
+(`historyArrived` also passes `dropPending`, `:249`), live messages and older pages. Box
+heights are stable, so loading pictures needs no anchoring.
 
 ## Alternatives rejected
 
-- **Reusing `media.open` for previews:** it calls `full()` first (`src/phone.rs:1653`),
-  so it asks the phone to upload the full image, waits up to `FULL_MEDIUM_WAIT`, and
-  caches full files in the store (`src/sync.rs:633`). That is the opposite of a
-  preview.
-- **Re-encoding thumbnails in the daemon:** it needs an image-decoding crate, and the
-  parser risk only moves to the daemon. Rejected in the intent.
-- **Base64 `data:` URLs in the protocol:** the NDJSON lines and queue cap
-  (`MAX_QUEUED`, 8 MiB) would carry image bytes to every client, the bar included.
-  Files in `media_dir` are how media already reach QML.
-- **`AnimatedImage` for GIF:** animation costs CPU on every frame, and the intent chose
-  the first frame.
-- **Requesting previews for every delegate in the list:** with the default
-  `cacheBuffer`, off-screen delegates would download too, and a full history would
-  fill the queue. Only delegates in view request.
-- **Cancelling running downloads:** with at most 2 running and a 2 MiB cap, a running
-  job finishing is cheap, and stopping a stream mid-flight adds code for no real gain.
+- **Reusing `media.open`:** it calls `full()` first (`src/phone.rs:1653`) and caches full
+  files in the store (`src/sync.rs:633`).
+- **Re-encoding in the daemon:** it needs a new crate, and the risk only moves to the
+  daemon (decided in the intent).
+- **Base64 `data:` URLs over the socket:** that puts image bytes through NDJSON and the
+  8 MiB queue cap, to every client.
+- **Collapsing a failed box back to the name row only:** that changes heights after
+  the fact, which forces anchor corrections for every failure. A fixed box with a glyph
+  is simpler and calmer. The name row is there in both cases.
+- **Per-attachment visibility:** mapping nested layout items into ListView coordinates
+  isn't reactive in QML. Per-message visibility costs at most a few extra small
+  downloads.
+- **Cancelling running downloads:** at most 2 run, capped at 2 MiB and 30 s, and the
+  result is cached anyway.
+- **`AnimatedImage`:** constant CPU, and the intent chose the first frame.
+- **Cancelling from `Component.onDestruction`:** delegates are rebuilt on every merge
+  (`:120`), so it would cancel work the replacement still wants.
 
 ## Risks
 
-- **Decoder flaws in the shell.** Qt's JPEG, PNG, GIF and WebP plugins run inside the
-  Omarchy shell on bytes the sender controls. The format, size and dimension checks cut
-  the attack surface; they don't remove it. A crash takes the bar down until the shell
-  restarts. This is the residual risk the intent accepted.
-- **Layout shift on failure.** A box that collapses after `not_found` changes the
-  height of a delegate in view. Positions above don't move. When following the end, the
-  list re-pins to the end.
-- **Preview quality.** If the phone sends only a tiny inline preview, it is scaled up
-  into the box and looks blurry. Open still shows the full picture.
-- **Cache eviction.** It is by mtime in a 64 MiB directory, which costs one `read_dir`
-  per written preview (a few dozen entries). That's cheap.
-- **Mixed versions.** A new plugin with an old daemon sees no `"previews"` and shows
-  name rows. An old plugin with a new daemon ignores the extra attachment fields and
-  methods.
+- **Decoder flaws in the shell.** The header checks narrow what reaches Qt, but don't
+  validate frame data. A crash takes the shell down until it restarts. This is the
+  accepted residual risk.
+- **Anchoring.** It relies on `indexAt` and `positionViewAtIndex`. If a merge removes
+  the anchor message, the list falls back to the nearest following message, or to the
+  end.
+- **Inline-only previews** are small and look blurry when scaled into the box. Open
+  shows the real picture.
+- **Transient memory** per download is one chunk plus the decryptor state above the
+  2 MiB buffer.
+- **Mixed versions:** a new plugin with an old daemon gets no `"previews"` and no
+  `preview` flags, so no boxes. An old plugin with a new daemon ignores the new fields.
 
 ## Verification
 
 - `cargo test --workspace`, `cargo clippy --all-targets -- -D warnings` and
   `nix build .#plugin` pass.
-- New unit tests in `src/sync.rs`:
-  - `image_kind`: JPEG, PNG, WebP and GIF are accepted; a PNG named `.jpg` is accepted
-    as `png`; text with an image MIME is refused;
-  - `accept_preview` refuses:
-    - bytes over 2 MiB;
-    - a header claiming 50 MP (a hand-built PNG IHDR with a 10000 × 5000 size);
-    - a header with a side over 16384;
-    - truncated bytes that `imagesize` can't read;
-  - `preview()`:
-    - an unknown message or index gives `not_found`;
-    - a non-image gives `not_found`;
-    - inline-only gives a path straight away, with the file under `previews/`;
-    - an uploaded preview queues one `Command::Preview`, and a second request for the
-      same key adds a waiter without a second command;
-    - a third different key while 2 are running is queued, not sent;
-    - `Previewed` replies to all waiters and starts the queued job;
-    - with the queue full (32 jobs), the next request gets `busy`;
-  - `cancel_preview` removes a queued job and replies `busy` to its waiters, and leaves
-    a running one alone;
-  - `forget(rid)` removes the waiter;
-  - `evict_previews` keeps the total ≤ 64 MiB, deletes the oldest first and never the
-    file just written (using small files and a lowered budget passed in);
-  - `Message::from_phone` carries `width` and `height`.
-- `tests/serve.rs`: `hello.features` contains `"previews"`; `media.preview` with an
-  empty message is `bad_request`; before pairing it gets the not-ready code of the other
-  media methods.
+- Unit tests in `src/sync.rs`:
+  - **`image_kind` and `accept_preview`, with tiny real fixtures** for PNG, JPEG, GIF
+    and WebP (VP8L) as byte literals:
+    - a PNG named `.jpg` is accepted as `png`;
+    - text is refused;
+    - over 2 MiB is refused;
+    - a PNG header claiming 10000 × 5000 is refused (over 40 MP);
+    - 20000 × 1 is refused (over 16384);
+    - 0 × 10 is refused;
+    - a truncated header is refused;
+    - a GIF's logical screen size is read correctly.
+  - **`preview()`:**
+    - an unknown message or index, or a non-image, gives `not_found`;
+    - inline-only gives a path under `previews/` straight away;
+    - a cache hit whose file was deleted downloads again;
+    - an uploaded preview sends one `Command::Preview`, and a second request for the
+      same key joins it with no second command;
+    - a third key while 2 run is queued;
+    - a full queue gives `busy`, with no waiter stored;
+    - `Commands::send` returning false frees the slot and replies `phone_offline`;
+    - `Previewed` with bad bytes and good inline bytes gives the inline path;
+    - with bad bytes and no inline bytes, `not_found`;
+    - a token left from before a reset is ignored.
+  - **The queue:**
+    - a job queued for more than 45 s is dropped with `busy`;
+    - a job left with no waiters after `forget` is dropped and never sent.
+  - **`cancel_preview`** removes only the given rids. Another connection's waiter on the
+    same key still gets the path.
+  - **`reset_media`** clears all preview state and replies to its waiters.
+  - **`evict_previews`:**
+    - with a small budget, it deletes the oldest first, by mtime then name, and never
+      `keep`;
+    - when removing a file fails (a read-only directory), it skips that file and
+      reaches the budget with the next one.
+  - **`Message::from_phone`** sets `preview`, `width` and `height`, and drops dimensions
+    outside `1..=16384`.
+- `src/phone.rs`: the streaming cap stops at the first chunk that would go over the
+  limit, tested with a fake chunk iterator through a small helper that takes chunks.
+- `tests/serve.rs`:
+  - `hello.features` contains `"previews"`;
+  - `media.preview` and `media.preview.cancel` with an empty message are `bad_request`;
+  - before pairing, `media.preview` gets the same code as `media.open`.
 - By hand on p620, after the deploy and a shell restart:
   - received and sent photos show inline;
-  - clicking one opens the viewer;
-  - a PDF still shows only its name row;
-  - scrolling back through a picture-heavy chat stays smooth and doesn't jump when a
-    new message arrives;
-  - with the phone offline, the boxes fall back to name rows;
-  - restarting the daemon with an old build (or reverting) hides the pictures.
+  - a picture still sending shows a placeholder, then the photo;
+  - clicking opens the viewer;
+  - a PDF has no box;
+  - scrolling back doesn't jump when new messages arrive;
+  - with the phone offline, boxes show the "no preview" glyph without changing size;
+  - switching A → B → A shows the right pictures;
+  - unpairing clears them;
+  - an old daemon (a revert) shows no boxes.
