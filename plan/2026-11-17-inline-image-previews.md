@@ -392,6 +392,14 @@ with this plan.
    → verify with `nix build .#plugin` (its install check runs `qmllint`), then
    `nix develop -c sh -c 'cargo test --workspace'`.
 
+   Deviations made while implementing (same behaviour):
+   - `onVisibleChanged`, `onCanPreviewChanged` and `onMessagesChanged` sit on `root`, where
+     those properties live; `onContentYChanged` and `onHeightChanged` are on `msgList`;
+   - a helper `previewParams(key)` parses `{message, index}` for both request and cancel;
+   - every error code except `not_found` counts as a retryable failure (cancelled replies
+     are still ignored through `req: 0`);
+   - the anchor is looked up only when not following the end;
+   - the "no preview" glyph gets the theme's font family and body size.
    Traps:
    - `indexAt` takes content coordinates;
    - `itemAtIndex` can be `null`;
