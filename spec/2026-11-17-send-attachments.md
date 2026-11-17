@@ -1,5 +1,5 @@
 ---
-status: draft
+status: approved
 issue: none (issues are disabled on olafkfreund/nix-gmsg-tui)
 intent: intent/2026-11-17-send-attachments.md
 ---
