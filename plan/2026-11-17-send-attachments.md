@@ -279,6 +279,11 @@ Self-contained: an implementer needs only this file and the code.
        `currentFiles` is a binding.
    → verify with `nix build .#plugin` (runs `qmllint`). Commit first if a new file is
    added (none expected).
+   Deviations made while implementing (cosmetic, same behaviour):
+   - a `canSend` property feeds both the Send button's `opacity` and `enabled`;
+   - the attach button is outlined (`border.color: Color.muted`, transparent fill),
+     not accent-filled, so it doesn't compete with Send;
+   - the chip's ✕ is a `MouseArea` inside its `Text`.
    Traps:
    - the arrow function and `Object.assign` work in Qt 6 QML JS;
    - `FileDialog.selectedFiles` is a list of `url`, so convert with `String()`;

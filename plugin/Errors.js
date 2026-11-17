@@ -12,6 +12,7 @@ var messages = {
     "unknown_method": "Unsupported operation.",
     "protocol_mismatch": "Daemon protocol mismatch. Please restart the service.",
     "busy": "Another operation is already in progress.",
+    "attachment": "Could not send the attachment.",
     "timeout": "Request timed out.",
     "internal": "Internal daemon error.",
     "disconnected": "Disconnected from the background service.",
@@ -50,6 +51,7 @@ function formatError(I18n, err) {
     if (!err) return format(I18n, "internal", "Unknown error");
     if (typeof err === "string") return format(I18n, err, err);
     // The daemon's own texts for internal errors (too large, no Downloads folder…) are fit to show.
-    if ((err.code || "internal") === "internal" && err.message) return String(err.message);
+    var code = err.code || "internal";
+    if ((code === "internal" || code === "attachment") && err.message) return String(err.message);
     return format(I18n, err.code || "internal", err.message || "Unknown error");
 }
