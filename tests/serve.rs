@@ -154,7 +154,10 @@ impl Client {
     fn hello(&mut self) {
         let hello = self.recv();
         assert_eq!(hello["data"]["protocol"], 1);
-        assert_eq!(hello["data"]["features"], json!(["attachments"]));
+        assert_eq!(
+            hello["data"]["features"],
+            json!(["attachments", "previews"])
+        );
         assert_eq!(
             self.request(0, "hello", json!({"protocol": 1, "role": "app"}))["ok"],
             true
@@ -180,6 +183,18 @@ fn protocol_and_login_methods() {
         client.request(1, "state", json!({}))["data"]["state"],
         "login"
     );
+    for method in ["media.preview", "media.preview.cancel"] {
+        assert_eq!(
+            client.request(40, method, json!({"message":"", "index":0}))["error"]["code"],
+            "bad_request"
+        );
+    }
+    for method in ["media.open", "media.preview"] {
+        assert_eq!(
+            client.request(41, method, json!({"message":"nope", "index":0}))["error"]["code"],
+            "not_found"
+        );
+    }
     client.raw("garbage");
     assert_eq!(client.recv()["error"]["code"], "bad_request");
     assert_eq!(client.request(2, "state", json!({}))["ok"], true);

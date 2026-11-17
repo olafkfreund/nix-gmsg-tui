@@ -710,6 +710,10 @@ impl Daemon {
     }
 
     fn expire(&mut self) {
+        if let Some(sync) = &mut self.sync {
+            let out = sync.pump_previews(std::time::Instant::now());
+            self.outputs(out);
+        }
         let expired: Vec<_> = self
             .pending
             .iter()
@@ -1150,6 +1154,48 @@ impl Daemon {
                     Err(e) => reply = Err(e),
                 }
             }
+            "media.preview" => match params::<proto::MediaParams>(request.params) {
+                Ok(p) if !p.message.is_empty() => {
+                    let rid = self.next_rid;
+                    self.next_rid += 1;
+                    self.pending.insert(
+                        rid,
+                        Pending {
+                            conn,
+                            id,
+                            until: Instant::now() + Duration::from_secs(60),
+                        },
+                    );
+                    let out = self
+                        .sync
+                        .as_mut()
+                        .expect("store checked")
+                        .preview(rid, &p.message, p.index);
+                    self.outputs(out);
+                    return;
+                }
+                Ok(_) => reply = Err("message required".into()),
+                Err(e) => reply = Err(e),
+            },
+            "media.preview.cancel" => match params::<proto::MediaParams>(request.params) {
+                Ok(p) if !p.message.is_empty() => {
+                    let rids: Vec<u64> = self
+                        .pending
+                        .iter()
+                        .filter(|(_, pending)| pending.conn == conn)
+                        .map(|(&rid, _)| rid)
+                        .collect();
+                    let out = self
+                        .sync
+                        .as_mut()
+                        .expect("store checked")
+                        .cancel_preview(&p.message, p.index, &rids);
+                    self.outputs(out);
+                    reply = Ok(json!({}));
+                }
+                Ok(_) => reply = Err("message required".into()),
+                Err(e) => reply = Err(e),
+            },
             "react" if self.state != proto::State::Ready => {
                 self.write(conn, &self.unready(Some(id)));
                 return;
