@@ -351,6 +351,9 @@ const HISTORY_COUNT: i64 = 30;
 const HISTORY_WORKERS: usize = 3;
 /// How long a message sent has to come back from the phone with its id.
 const ECHO_WAIT: Duration = Duration::from_secs(10);
+/// The longest a send may take, uploads included: under the daemon's 900 s deadline, so
+/// its reply still reaches the client.
+const SEND_WAIT: Duration = Duration::from_secs(870);
 /// How long the phone has to send a medium in full, once asked.
 const FULL_MEDIUM_WAIT: Duration = Duration::from_secs(30);
 /// Between two attempts to make the session active, until it is.
@@ -1142,7 +1145,14 @@ async fn run_commands(state: Rc<State>, mut commands: UnboundedReceiver<Command>
                 files,
             } => {
                 tokio::task::spawn_local(async move {
-                    let outcome = send(&state, &conversation, text, reply, files).await;
+                    // Sent must always fire: it frees the one-upload slot in Sync, and the
+                    // HTTP client has no read timeout, so a stalled upload would hold it.
+                    let outcome = tokio::time::timeout(
+                        SEND_WAIT,
+                        send(&state, &conversation, text, reply, files),
+                    )
+                    .await
+                    .unwrap_or_else(|_| SendOutcome::Uncertain("send timed out".into()));
                     state.emit(Event::Sent {
                         id,
                         conversation,

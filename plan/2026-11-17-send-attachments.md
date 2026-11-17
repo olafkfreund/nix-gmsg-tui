@@ -105,6 +105,11 @@ Self-contained: an implementer needs only this file and the code.
      Every error also writes `tracing::debug!(path = %path.display(), %error, "attachment refused")`
      with the OS error where there is one.
    - `SendOutcome` gains `Attachment(String)`.
+   - (Added after the final review.) The dispatch at `src/phone.rs:1144` wraps
+     `send(..)` in `tokio::time::timeout(SEND_WAIT)`, with `SEND_WAIT = 870 s`. On
+     timeout it gives `SendOutcome::Uncertain("send timed out")`. Reason: the HTTP client
+     sets only a connect timeout, so a stalled upload never ends, `Event::Sent` never
+     fires, and the upload guard (step 2) would stay held until a restart.
    - In `send()` (`src/phone.rs:1388`):
      - First, if `files` is not empty:
        `tokio::task::spawn_blocking(move || read_files(&files, MEDIA_MAX)).await`. An `Err` returns
