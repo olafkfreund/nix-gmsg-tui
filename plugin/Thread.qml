@@ -161,6 +161,12 @@ Item {
     // "m:<message>:<index>" -> {busy, err, saved}, "r:<message>" -> {busy} while a react is in flight.
     property var ui: ({})
 
+    // A JS array read back through a delegate's modelData is a reference object that
+    // Array.isArray rejects (length still works); copy it into a real array.
+    function arr(x) {
+        return x ? Array.prototype.slice.call(x) : [];
+    }
+
     function setUi(key, patch) {
         var next = Object.assign({}, root.ui);
         if (patch === null) delete next[key];
@@ -295,7 +301,7 @@ Item {
     function react(msg, emoji) {
         var rk = "r:" + msg.id;
         if ((root.ui[rk] || ({})).busy) return;
-        var list = Array.isArray(msg.reactions) ? msg.reactions : [];
+        var list = root.arr(msg.reactions);
         var same = false, any = false;
         for (var i = 0; i < list.length; i++) {
             if (list[i].mine) {
@@ -560,7 +566,7 @@ Item {
                     readonly property bool isPending: modelData.pending === true
                     readonly property bool reactable: root.reactable(modelData)
                     readonly property bool reactBusy: (root.ui["r:" + modelData.id] || ({})).busy === true
-                    readonly property var reactions: Array.isArray(modelData.reactions) ? modelData.reactions : []
+                    readonly property var reactions: root.arr(modelData.reactions)
 
                     HoverHandler {
                         id: rowHover
@@ -646,7 +652,7 @@ Item {
                             }
 
                             Repeater {
-                                model: Array.isArray(bubbleRow.modelData.attachments) ? bubbleRow.modelData.attachments : []
+                                model: root.arr(bubbleRow.modelData.attachments)
 
                                 ColumnLayout {
                                     id: att
