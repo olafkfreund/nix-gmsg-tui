@@ -231,3 +231,12 @@ Not proposed, unless you want it.
   with its name; the composer keeps the draft on failure; an old daemon shows no attach
   button, and files picked before a reconnect to an old daemon are not sent; picking the
   same file twice, then sending while removing one chip, leaves the right chips.
+
+## Amendment (2026-11-17, after deploy)
+
+Pictures sent with `dimensions` set on the media part reached the phone as text only: the
+phone dropped the media part (owner-confirmed on the phone, two sends). mautrix-gmessages,
+whose sends work, sets no dimensions; everything else on the wire matches it (message
+layout, upload, `MediaContent` fields, chunked AES-GCM). So `send()` no longer sets
+`Media::dimensions`. Intent outcome 6 ("images carry width and height") is dropped by the
+owner's decision. `read_files` still reads the size; it is harmless and kept for the tests.
