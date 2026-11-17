@@ -52,8 +52,10 @@ Self-contained: an implementer needs only this file and the code.
   every Rust step. Run them with `nix develop -c sh -c '…'`, because the host lacks the
   openssl headers.
 - Leave the `allow(dead_code)` attributes in `src/main.rs` alone.
-- No message text, numbers, contact names, conversation ids, keys, file names or paths go
-  into `phone.log`, into `tracing` above `debug`, or into the journal.
+- No message text, numbers, contact names, conversation ids or keys go into `phone.log`,
+  `tracing` or the journal. File names, paths and OS error texts may appear only in
+  `tracing::debug!` records (they reach `phone.log` only when the env filter enables
+  debug, `src/phone.rs:1881`), never at `info` or above.
 - **Trap:** `src/phone.rs` has its own `log` module (`src/phone.rs:1869`), with `warn`
   only. Use `tracing::debug!` directly for the detailed lines.
 - **Trap:** there is no `tempfile` crate. Tests make a unique directory under
@@ -73,21 +75,23 @@ Self-contained: an implementer needs only this file and the code.
      `files: Vec<PathBuf>`. Update the dispatch at `src/phone.rs:1134-1142` and the one
      constructor, `src/sync.rs:1194-1200`, which passes `files: Vec::new()` for now
      (step 2 passes the real list). `phone::Attachment` (`src/phone.rs:316`) stays as is.
-   - Add `fn read_files(paths: &[PathBuf]) -> Result<Vec<Attachment>, String>`, plus a
+   - Add `fn read_files(paths: &[PathBuf], max: usize) -> Result<Vec<Attachment>, String>`
+    (`send` passes `MEDIA_MAX`; tests pass a small `max`), plus a
      private `fn file_name(path: &Path) -> String`. `file_name` takes the base name, drops
      the characters `save_download` drops (`src/sync.rs:1386-1392`: `is_control()`,
      U+200B–U+200F, U+202A–U+202E, U+2060–U+2069, U+FEFF) and falls back to `"file"`.
-     For each path, in order:
+     Before the loop: `let mut total = 0usize`. For each path, in order:
      1. `let name = file_name(path)`.
      2. `OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(path)`
         (`use std::os::unix::fs::OpenOptionsExt`). An error gives
         `"{name}: cannot read"`.
      3. `file.metadata()`: not `is_file()` gives `"{name}: not a file"`; `len() == 0`
         gives `"{name}: empty"`.
-     4. `remaining = MEDIA_MAX - total`; read with
+     4. `remaining = max - total`; read with
         `(&file).take(remaining as u64 + 1).read_to_end(&mut data)`. Reading more than
         `remaining` gives `"{name}: too large (over 100 MiB in all)"`; reading 0 bytes
-        gives `"{name}: empty"`; a read error gives `"{name}: cannot read"`.
+        gives `"{name}: empty"`; a read error gives `"{name}: cannot read"`. Then
+        `total += data.len()`.
      5. `content_type = mime_for(&name)`: a `const MIME: &[(&str, &str)]` keyed on the
         lowercase extension (jpg, jpeg → image/jpeg; png; gif; webp; heic; heif; bmp;
         mp4 → video/mp4; 3gp → video/3gpp; mov → video/quicktime; webm; mkv →
@@ -103,7 +107,7 @@ Self-contained: an implementer needs only this file and the code.
    - `SendOutcome` gains `Attachment(String)`.
    - In `send()` (`src/phone.rs:1388`):
      - First, if `files` is not empty:
-       `tokio::task::spawn_blocking(move || read_files(&files)).await`. An `Err` returns
+       `tokio::task::spawn_blocking(move || read_files(&files, MEDIA_MAX)).await`. An `Err` returns
        `SendOutcome::Attachment(msg)`. A join error returns
        `SendOutcome::Attachment("attachment: cannot read".into())`.
      - Then, in the upload loop (`:1404-1416`), an upload error does
@@ -123,15 +127,15 @@ Self-contained: an implementer needs only this file and the code.
    - Tests in `src/phone.rs`'s test module (`:1894`): a jpeg/png with the right name, MIME
      and size (write a tiny valid PNG: the 67-byte 1×1 PNG as a byte literal); a
      directory gives `not a file`; an empty file gives `empty`; a missing path gives
-     `cannot read`; two files over 100 MiB together give `too large` (create with
-     `File::set_len` so they're sparse, not written); a name with `\u{202E}` and `\n` is
+     `cannot read`; with `max = 10`, two 6-byte files give `too large` while one passes
+     (each under the limit alone, so a missing `total` update fails the test); a name with `\u{202E}` and `\n` is
      cleaned in the error; `x.unknown` gives `application/octet-stream`; a FIFO made with
-     `libc::mkfifo` gives `not a file`, run in a thread joined with
-     `recv_timeout(5 s)` so a blocking open fails the test instead of hanging it.
+     `libc::mkfifo` gives `not a file`. Run it in a thread that sends the result on an
+     `mpsc` channel. The test does `rx.recv_timeout(5 s)` and panics on timeout without
+     joining: joining a blocked thread would hang the test.
    → verify with
    `nix develop -c sh -c 'cargo test --workspace && cargo clippy --all-targets -- -D warnings'`.
    Traps: `MEDIA_MAX` is a `usize` at `src/phone.rs:1481`; read it, don't copy it.
-   Sparse 100 MiB files are fine on tmpfs.
 
 2. **`src/proto.rs`, `src/serve.rs`, `src/sync.rs`, `tests/serve.rs`: protocol, request
    checks, the upload guard.**
@@ -147,22 +151,29 @@ Self-contained: an implementer needs only this file and the code.
      - The `Ok(p)` guard becomes: refuse with
        `"conversation and text or attachments required"` when `p.conversation` is empty,
        or when both `p.text` and `p.attachments` are empty.
-     - New guards: more than 10 attachments gives `"at most 10 attachments"`; any path
+     - New guards, still in the `match`: more than 10 attachments gives `"at most 10 attachments"`; any path
        that is empty or not `Path::new(a).is_absolute()` gives
        `"attachments must be absolute paths"`. These replies go out as `bad_request`
        through the existing `reply = Err(..)` path.
-     - Ready with attachments, while `self.sync` reports `upload_busy()`: write
+     - When ready, compute `until` first:
+       `Duration::from_secs(if p.attachments.is_empty() { 120 } else { 900 })`.
+     - Then call
+       `sync.send(rid, p.conversation, p.text, p.reply_to, p.attachments.into_iter().map(PathBuf::from).collect())`
+       **before** inserting into `self.pending`. If it returns `false`, write
        `proto::Reply::err(Some(id), proto::ErrorCode::Busy, "another upload is in progress")`
-       and return, as `:1052` does.
-     - `until`: `Duration::from_secs(if p.attachments.is_empty() { 120 } else { 900 })`.
-     - The call becomes
-       `sync.send(rid, p.conversation, p.text, p.reply_to, p.attachments.into_iter().map(PathBuf::from).collect())`.
+       and `return`, as `:1052` does, without inserting a pending entry or bumping
+       `next_rid`. If it returns `true`, insert the pending entry as today.
    - `sync.rs`:
      - The `Sync` struct gains `uploading: Option<u64>`, initialised to `None` wherever
        `Sync` is constructed.
-     - `pub fn upload_busy(&self) -> bool { self.uploading.is_some() }`.
-     - `send(..)` (`:1192`) takes `files: Vec<PathBuf>`. If it is not empty, it sets
-       `self.uploading = Some(rid)`, then sends `phone::Command::Send { files, .. }`.
+     - `send(..)` (`:1192`) takes `files: Vec<PathBuf>` and returns `bool`. If `files`
+       is not empty and `self.uploading.is_some()`, it returns `false` and dispatches
+       nothing. Otherwise it sets `self.uploading = Some(rid)` when `files` is not
+       empty, inserts into `sends`, sends `phone::Command::Send { files, .. }` and returns
+       `true`. Text-only sends are never refused. The name `busy()` is already taken by
+       an existing method; don't reuse it.
+     - Update the existing test call at `src/sync.rs:1920` to pass `Vec::new()` (and
+       ignore or assert the `bool`).
      - In the `phone::Event::Sent` handler (`:1018-1024`): if
        `self.uploading == Some(id)`, set it to `None`.
      - `forget` (`:675`) does **not** touch `uploading`. Add a one-line comment saying
@@ -170,9 +181,15 @@ Self-contained: an implementer needs only this file and the code.
      - If `Sync` is replaced or dropped on unpair, the new one starts with `None`. Nothing
        to carry over.
    - Tests:
-     - `src/sync.rs`: `Attachment` maps to an `attachment` error reply. `send` with one
-       file sets `upload_busy()`; `forget(rid)` leaves it busy; `Event::Sent` for that
-       rid clears it; `Event::Sent` for another rid doesn't. An `Accepted` outcome whose
+     - `src/sync.rs`, using `phone::Commands::detached()` as `:1555` does:
+       - `Attachment` maps to an `attachment` error reply.
+       - `send` with one file returns `true` and dispatches one `Command::Send`.
+       - A second `send` with a file returns `false` and dispatches nothing
+         (`try_recv` is empty).
+       - A text-only `send` meanwhile returns `true`.
+       - After `forget(first_rid)`, a file send still returns `false`.
+       - After `Event::Sent` for another rid it is still `false`; after `Event::Sent`
+         for the first rid it returns `true`. An `Accepted` outcome whose
        message has one `media` value (a `phone::Medium` JSON with mime and name) gives a
        `message` event whose `attachments` has that name.
      - `tests/serve.rs`:
@@ -233,13 +250,15 @@ Self-contained: an implementer needs only this file and the code.
        `required property var modelData` and `required property int index`, and shows a
        rounded rectangle with the plain-text name (elided, max ~180 px) and a `✕`
        `MouseArea` that calls `root.removeFile(root.conversationId, modelData.key)`.
-     - `submit()` replaces `:45-80`:
+     - `submit()` replaces the whole function, `:45-82`:
        - Snapshot `conv`, `raw = String(inputField.text || "")`, `body = raw.trim()`,
          `reply = root.replyToId`, `sent = currentFiles.slice()`.
        - Return if sending, no `conv`, or `body === ""` with `sent.length === 0`.
        - If `sent.length > 0 && !root.canAttach`: set
          `errorNote = I18n.t("gmessages.attach_unsupported", "The background service can't send files; update it.")`
          and return.
+       - Then, as today (`:50-52`): `sending = true`, `statusNote = ""`,
+         `errorNote = ""`.
        - `params = { conversation: conv, text: body }`; add `reply_to` as today; add
          `attachments: sent.map(f => f.path)` when there are files.
        - Callback:
