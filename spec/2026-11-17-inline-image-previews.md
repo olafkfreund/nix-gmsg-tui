@@ -326,3 +326,22 @@ heights are stable, so loading pictures needs no anchoring.
   - switching A → B → A shows the right pictures;
   - unpairing clears them;
   - an old daemon (a revert) shows no boxes.
+
+## Amendments (approved together with the plan)
+
+Found by the Codex review of the plan, each checked in the code:
+1. **Queue expiry 25 s, not 45 s.** With the 30 s download timeout, a job then always
+   ends before the 60 s pending deadline. `pump_previews` also runs on every 100 ms
+   `expire()` tick in serve (`src/serve.rs:300`, `:712`), before pending requests
+   expire, so expiry replies `busy` rather than `timeout`.
+2. **Pictures sent from the panel** carry the full `media_id` with no `thumb_id` or
+   `inline` (`gmessages-proto/src/media.rs:84`), so `preview` is false and they show the
+   name row only. They get a picture once the phone's echo or a later fetch carries
+   preview data. The "picture still sending shows a placeholder" check applies only
+   when preview data is present. No full download is added to make it show.
+3. **`tries` counts failures only.** A cancelled request doesn't use up an attempt, so
+   scrolling back and forth keeps working. Each request also carries its own id, so a
+   late reply from a cancelled request can't overwrite a newer one.
+4. **The in-view set is computed by Thread** from `msgList.indexAt` over the visible
+   range, not maintained by delegates. Membership is then always current after rebuilds
+   and resets.
